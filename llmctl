@@ -8,7 +8,7 @@ detached: closing the UI or the terminal does not stop them.
 Only the Python standard library is used.
 
 Author: Dr. Leonhard Horstmeyer <mail@leonhardhorstmeyer.com>
-License: MIT
+Copyright (c) 2026 SIA LaiZinat. License: MIT
 """
 import argparse
 import copy

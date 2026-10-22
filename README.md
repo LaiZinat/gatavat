@@ -122,4 +122,4 @@ Dr. Leonhard Horstmeyer ([@leomarlo](https://github.com/leomarlo)), mail@leonhar
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE), copyright © 2026 SIA LaiZinat
