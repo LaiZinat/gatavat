@@ -1,0 +1,633 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llmctl</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --border: #dfe3e8; --text: #1c2026; --muted: #69727d;
+  --accent: #2f6fde; --accent-text: #fff; --danger: #c63d3d; --ok: #1f9d55; --warn: #c98a12;
+  --code: #f0f2f5; --input: #fff;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171b; --panel: #1c2026; --border: #2e343c; --text: #e4e7eb; --muted: #8d96a0;
+    --accent: #5b8ff0; --accent-text: #0d1117; --danger: #e06666; --ok: #3ccf7a; --warn: #e0a83a;
+    --code: #121519; --input: #161a1f;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+code, pre, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 14px 20px;
+  border-bottom: 1px solid var(--border); background: var(--panel); position: sticky; top: 0; z-index: 5; }
+header h1 { font-size: 17px; margin: 0 8px 0 0; }
+header .spacer { flex: 1; }
+.binary { color: var(--muted); font-size: 12px; }
+.binary.err { color: var(--danger); }
+main { padding: 20px; max-width: 1400px; margin: 0 auto; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 16px; }
+@media (max-width: 480px) { .grid { grid-template-columns: 1fr; } main { padding: 16px; } }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px;
+  display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.card-head { display: flex; align-items: flex-start; gap: 10px; }
+.card-head .title { flex: 1; min-width: 0; }
+.card-head h2 { font-size: 15px; margin: 0; overflow-wrap: anywhere; }
+.sub { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 99px;
+  font-size: 12px; border: 1px solid var(--border); white-space: nowrap; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.st-ready .dot { background: var(--ok); }
+.st-loading .dot, .st-starting .dot { background: var(--warn); animation: pulse 1s infinite alternate; }
+.st-exited .dot { background: var(--danger); }
+@keyframes pulse { from { opacity: 1 } to { opacity: .3 } }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.quick { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+label.f { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); min-width: 0; }
+label.f.check { flex-direction: row; align-items: center; gap: 6px; color: var(--text); font-size: 13px; }
+input[type=text], select { width: 100%; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--input); color: var(--text); font: inherit; font-size: 13px; }
+input.dirty, select.dirty { border-color: var(--accent); }
+button { font: inherit; font-size: 13px; padding: 6px 12px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--panel); color: var(--text); }
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { opacity: .45; cursor: default; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+button.danger { color: var(--danger); }
+button.link { border: none; background: none; padding: 2px 4px; color: var(--accent); }
+details { border-top: 1px solid var(--border); padding-top: 8px; }
+summary { cursor: pointer; color: var(--muted); font-size: 13px; user-select: none; }
+.group { margin-top: 10px; }
+.group h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 6px; }
+.fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+.fields .wide { grid-column: 1 / -1; }
+.cmd { background: var(--code); border: 1px solid var(--border); border-radius: 6px; padding: 8px;
+  white-space: pre-wrap; word-break: break-all; margin: 0; }
+.warn { color: var(--warn); font-size: 12px; }
+.chat-opts { display: flex; gap: 8px; flex-wrap: wrap; }
+.chat-log { height: 52vh; overflow: auto; display: flex; flex-direction: column; gap: 10px; padding: 4px; }
+.msg { padding: 8px 12px; border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; max-width: 90%; }
+.msg.user { align-self: flex-end; background: var(--accent); color: var(--accent-text); }
+.msg.assistant { align-self: flex-start; background: var(--code); border: 1px solid var(--border); }
+.msg.error { align-self: flex-start; color: var(--danger); border: 1px solid var(--danger); }
+.msg details { border: none; padding: 0 0 6px; color: var(--muted); font-size: 12.5px; }
+.chat-input { display: flex; gap: 8px; align-items: stretch; }
+.chat-input textarea { flex: 1; resize: vertical; padding: 8px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--input); color: var(--text); font: inherit; }
+.spec-grid { display: grid; grid-template-columns: max-content 1fr; gap: 3px 14px; font-size: 13px; }
+.spec-grid span:nth-child(odd) { color: var(--muted); }
+.err { color: var(--danger); font-size: 12px; }
+.badge { font-size: 11px; padding: 1px 7px; border-radius: 99px; background: var(--code); color: var(--muted);
+  border: 1px solid var(--border); }
+dialog { border: 1px solid var(--border); border-radius: 10px; background: var(--panel); color: var(--text);
+  width: min(1000px, calc(100vw - 32px)); padding: 0; }
+dialog::backdrop { background: rgba(0,0,0,.45); }
+.dlg-head { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+.dlg-head h2 { font-size: 15px; margin: 0; flex: 1; }
+.dlg-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+.log { height: 60vh; overflow: auto; background: var(--code); border-radius: 6px; padding: 10px; margin: 0;
+  white-space: pre-wrap; word-break: break-all; }
+#toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); max-width: calc(100vw - 32px);
+  background: var(--text); color: var(--bg); padding: 10px 14px; border-radius: 8px; white-space: pre-wrap;
+  display: none; z-index: 20; font-size: 13px; }
+#toast.error { background: var(--danger); color: #fff; }
+.global { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+@media (max-width: 600px) { .global, .quick { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>llmctl</h1>
+  <span id="binary" class="binary"></span>
+  <span class="pill" id="gateway" title="One endpoint for all models (used by opencode), routed by model name">
+    <span class="dot"></span><span id="gateway-label">gateway</span></span>
+  <button id="btn-gateway" class="link"></button>
+  <span class="spacer"></span>
+  <button id="btn-autostart">Start autostart models</button>
+  <button id="btn-stopall" class="danger">Stop all</button>
+  <button id="btn-opencode">opencode.json…</button>
+  <button id="btn-add">Add model</button>
+  <button id="btn-global">Settings</button>
+</header>
+<main>
+  <div id="grid" class="grid"></div>
+</main>
+
+<dialog id="dlg-logs">
+  <div class="dlg-head"><h2 id="logs-title">Logs</h2>
+    <label class="f check"><input type="checkbox" id="logs-follow" checked> follow</label>
+    <button onclick="this.closest('dialog').close()">Close</button></div>
+  <div class="dlg-body"><div class="sub mono" id="logs-path"></div><pre id="logs-pre" class="log mono"></pre></div>
+</dialog>
+
+<dialog id="dlg-add">
+  <form method="dialog" id="add-form">
+    <div class="dlg-head"><h2>Add model</h2></div>
+    <div class="dlg-body">
+      <label class="f">Id (letters, digits, . _ -)<input type="text" id="add-id" required pattern="[A-Za-z0-9][A-Za-z0-9_.\-]*"></label>
+      <label class="f">Copy settings from<select id="add-from"><option value="">(blank model)</option></select></label>
+      <div class="row"><span class="spacer" style="flex:1"></span>
+        <button value="cancel" formnovalidate>Cancel</button><button class="primary" value="ok">Add</button></div>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-global">
+  <form method="dialog" id="global-form">
+    <div class="dlg-head"><h2>Global settings</h2></div>
+    <div class="dlg-body">
+      <div class="global">
+        <label class="f">llama-server binary (name on PATH or full path)<input type="text" name="llama_server"></label>
+        <label class="f">opencode.json path<input type="text" name="opencode_path"></label>
+        <label class="f">UI host (next start)<input type="text" name="ui_host"></label>
+        <label class="f">UI port (next start)<input type="text" name="ui_port"></label>
+        <label class="f">Gateway host<input type="text" name="gateway_host"></label>
+        <label class="f">Gateway port<input type="text" name="gateway_port"></label>
+        <label class="f">Start gateway with first model<select name="gateway_autostart">
+          <option value="true">yes</option><option value="false">no</option></select></label>
+        <label class="f">opencode export<select name="opencode_mode">
+          <option value="gateway">one provider via gateway</option><option value="per-model">one provider per model</option></select></label>
+        <label class="f">opencode provider id (gateway mode)<input type="text" name="opencode_provider_id"></label>
+      </div>
+      <div class="sub">Config file: <span class="mono" id="config-path"></span></div>
+      <div class="row"><span style="flex:1"></span>
+        <button value="cancel" formnovalidate>Cancel</button><button class="primary" value="ok">Save</button></div>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="dlg-opencode">
+  <div class="dlg-head"><h2>opencode.json</h2>
+    <button id="opencode-write" class="primary">Write (backs up existing)</button>
+    <button onclick="this.closest('dialog').close()">Close</button></div>
+  <div class="dlg-body">
+    <div class="sub">Providers are generated from models with an <code>opencode_provider</code> set: base URL from host/port,
+      context limit from <code>ctx_size</code>. Everything else in the file is kept.</div>
+    <div class="sub mono" id="opencode-path"></div>
+    <pre id="opencode-pre" class="log mono" style="height:55vh"></pre>
+  </div>
+</dialog>
+
+<dialog id="dlg-chat">
+  <div class="dlg-head"><h2 id="chat-title">Chat</h2>
+    <button id="chat-clear">Clear</button>
+    <button onclick="this.closest('dialog').close()">Close</button></div>
+  <div class="dlg-body">
+    <div class="chat-opts" id="chat-opts">
+      <label class="f" style="flex:1">System prompt<input type="text" id="chat-system" placeholder="(none)"></label>
+      <label class="f">Temperature<input type="text" id="chat-temp" placeholder="default" size="7"></label>
+      <label class="f">Max tokens<input type="text" id="chat-max" value="2048" size="7"></label>
+      <label class="f" id="chat-think-wrap">Thinking<select id="chat-think">
+        <option value="">server setting</option><option value="on">on</option><option value="off">off</option></select></label>
+    </div>
+    <div id="chat-log" class="chat-log"></div>
+    <div class="sub" id="chat-stats"></div>
+    <form id="chat-form" class="chat-input">
+      <textarea id="chat-text" rows="3" placeholder="Message — Enter to send, Shift+Enter for a new line"></textarea>
+      <button class="primary" id="chat-send">Send</button>
+    </form>
+  </div>
+</dialog>
+
+<div id="toast"></div>
+
+<script>
+const CTX_PRESETS = [2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144];
+let STATE = null;
+const cards = {};          // id -> {el, dirty:Set}
+let logsFor = null, logsTimer = null;
+
+async function api(path, opts = {}) {
+  const r = await fetch(path, { ...opts, headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'llmctl' } });
+  const j = await r.json().catch(() => ({ error: r.statusText }));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+const post = (path, body) => api(path, { method: 'POST', body: JSON.stringify(body || {}) });
+
+function toast(msg, isError) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.className = isError ? 'error' : ''; t.style.display = 'block';
+  clearTimeout(t._h); t._h = setTimeout(() => t.style.display = 'none', isError ? 8000 : 2500);
+}
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+async function act(fn, okMsg) {
+  try { const s = await fn(); if (s && s.models) apply(s); if (okMsg) toast(okMsg); return s; }
+  catch (e) { toast(e.message, true); }
+}
+
+// ---------------------------------------------------------------- rendering
+function fieldInput(f, v) {
+  const id = `f-${f.key}`;
+  if (f.type === 'bool')
+    return `<label class="f check" title="${esc(f.help)}"><input type="checkbox" data-key="${f.key}" ${v ? 'checked' : ''}> ${f.key}</label>`;
+  let input;
+  if (f.type === 'choice') {
+    input = `<select data-key="${f.key}"><option value="">${f.key === 'thinking' ? 'model default' : 'default'}</option>${f.choices.map(c =>
+      `<option ${c === v ? 'selected' : ''}>${c}</option>`).join('')}</select>`;
+  } else {
+    const list = f.key === 'ctx_size' ? 'list="ctx-presets"' : '';
+    const ph = f.key === 'threads' ? 'auto' : (f.type === 'int' || f.type === 'float') ? 'default' : '';
+    input = `<input type="text" data-key="${f.key}" value="${esc(v ?? '')}" placeholder="${ph}" ${list} spellcheck="false">`;
+  }
+  const wide = ['model', 'extra_args', 'name'].includes(f.key) ? 'wide' : '';
+  return `<label class="f ${wide}" title="${esc(f.help)}">${f.key}${input}</label>`;
+}
+
+// The thinking switch only makes sense for models whose chat template supports it.
+const canThink = m => m.specs?.thinking_support === 'toggle';
+const showField = (f, m) => f.key !== 'thinking' || canThink(m) || m.config.thinking;
+
+function cardHTML(m) {
+  const groups = {};
+  for (const f of STATE.fields) (groups[f.group] ||= []).push(f);
+  const quickKeys = ['ctx_size', 'port'];
+  const settings = Object.entries(groups).map(([g, fs]) => `
+    <div class="group"><h3>${esc(g)}</h3><div class="fields">
+      ${fs.filter(f => !quickKeys.includes(f.key) && showField(f, m)).map(f => fieldInput(f, m.config[f.key])).join('')}
+    </div></div>`).join('');
+  const byKey = Object.fromEntries(STATE.fields.map(f => [f.key, f]));
+  return `
+    <div class="card-head">
+      <div class="title"><h2>${esc(m.config.name)}</h2>
+        <div class="sub"><span class="mono">${esc(m.id)}</span> · <a class="mono" data-url target="_blank"></a></div></div>
+      <span class="pill" data-pill><span class="dot"></span><span data-state></span></span>
+    </div>
+    <div class="sub" data-specs></div>
+    <div class="quick">${quickKeys.map(k => fieldInput(byKey[k], m.config[k])).join('')}</div>
+    <div class="row" data-notes></div>
+    <div class="row">
+      <button class="primary" data-act="start">Start</button>
+      <button data-act="restart">Restart</button>
+      <button class="danger" data-act="stop">Stop</button>
+      <button data-act="logs">Logs</button>
+      <button data-act="chat">${m.config.embedding ? 'Test' : 'Chat'}</button>
+      <span style="flex:1"></span>
+      <button data-act="save" class="primary" hidden>Save</button>
+      <button data-act="revert" hidden>Revert</button>
+    </div>
+    <details><summary>All settings &amp; command</summary>
+      <div class="group"><h3>Specs (from GGUF)</h3><div class="spec-grid" data-specs-full></div></div>
+      ${settings}
+      <div class="group"><h3>Command</h3><pre class="cmd mono" data-cmd></pre></div>
+      <div class="row" style="margin-top:10px">
+        ${m.is_default ? '<button data-act="reset">Reset to defaults</button>' : ''}
+        <button class="danger" data-act="delete">Delete model</button>
+      </div>
+    </details>`;
+}
+
+function readForm(card) {
+  const cfg = {};
+  card.querySelectorAll('[data-key]').forEach(el => {
+    cfg[el.dataset.key] = el.type === 'checkbox' ? el.checked : el.value;
+  });
+  return cfg;
+}
+
+function updateDirty(id) {
+  const c = cards[id], m = STATE.models.find(x => x.id === id);
+  let any = false;
+  c.el.querySelectorAll('[data-key]').forEach(el => {
+    const orig = m.config[el.dataset.key];
+    const cur = el.type === 'checkbox' ? el.checked : el.value;
+    const d = el.type === 'checkbox' ? cur !== !!orig : cur.trim() !== String(orig ?? '');
+    el.classList.toggle('dirty', d); any ||= d;
+  });
+  c.dirty = any;
+  c.el.querySelector('[data-act=save]').hidden = !any;
+  c.el.querySelector('[data-act=revert]').hidden = !any;
+}
+
+function mountCard(m) {
+  const el = document.createElement('div');
+  el.className = 'card';
+  el.innerHTML = cardHTML(m);
+  cards[m.id] = { el, dirty: false };
+  el.addEventListener('input', () => updateDirty(m.id));
+  el.addEventListener('change', () => updateDirty(m.id));
+  el.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.matches('input[type=text]')) save(m.id); });
+  el.addEventListener('click', e => {
+    const b = e.target.closest('[data-act]'); if (!b) return;
+    const a = b.dataset.act, enc = encodeURIComponent(m.id);
+    if (a === 'save') save(m.id);
+    else if (a === 'revert') { el.innerHTML = cardHTML(STATE.models.find(x => x.id === m.id)); cards[m.id].dirty = false; updateStatus(STATE.models.find(x => x.id === m.id)); }
+    else if (a === 'logs') openLogs(m.id);
+    else if (a === 'chat') openChat(m.id);
+    else if (a === 'delete') { if (confirm(`Delete ${m.id}? (stops it if running)`)) act(() => api(`/api/models/${enc}`, { method: 'DELETE' }), 'deleted'); }
+    else if (a === 'reset') { if (confirm(`Reset ${m.id} to built-in defaults?`)) act(() => post(`/api/models/${enc}/reset`), 'reset').then(() => remount(m.id)); }
+    else if (['start', 'stop', 'restart'].includes(a)) {
+      const go = async () => {
+        if (cards[m.id].dirty && a !== 'stop') await save(m.id, true);
+        b.disabled = true;
+        return post(`/api/models/${enc}/${a}`);
+      };
+      act(go, a === 'stop' ? `stopped ${m.id}` : `${a}ed ${m.id} — loading…`);
+    }
+  });
+  return el;
+}
+
+function remount(id) {
+  const m = STATE.models.find(x => x.id === id);
+  if (!m || !cards[id]) return;
+  cards[id].el.innerHTML = cardHTML(m); cards[id].dirty = false; updateStatus(m);
+}
+
+async function save(id, quiet) {
+  const s = await act(() => post(`/api/models/${encodeURIComponent(id)}`, readForm(cards[id].el)), quiet ? null : `saved ${id}`);
+  if (s) remount(id);
+  return s;
+}
+
+function updateStatus(m) {
+  const c = cards[m.id]; if (!c) return;
+  const st = m.status, el = c.el;
+  const labels = { ready: 'ready', loading: 'loading model…', starting: 'starting…', stopped: 'stopped', exited: 'exited (see logs)' };
+  el.querySelector('[data-pill]').className = `pill st-${st.state}`;
+  el.querySelector('[data-state]').textContent = labels[st.state] + (st.pid ? ` · pid ${st.pid}` : '');
+  const a = el.querySelector('[data-url]'); a.textContent = st.url; a.href = st.url.replace(/\/v1$/, '/');
+  const running = ['ready', 'loading', 'starting'].includes(st.state);
+  el.querySelector('[data-act=start]').disabled = running;
+  el.querySelector('[data-act=stop]').disabled = !running && st.state !== 'exited';
+  el.querySelector('[data-act=restart]').disabled = !running;
+  el.querySelector('[data-act=chat]').disabled = st.state !== 'ready';
+  const notes = [];
+  if (!st.model_found) notes.push(`<span class="err">model file not found: <span class="mono">${esc(st.model_path)}</span></span>`);
+  if (st.stale) notes.push(`<span class="warn">running with different settings — restart to apply</span>`);
+  if (m.config.autostart) notes.push(`<span class="badge">autostart</span>`);
+  if (m.config.embedding) notes.push(`<span class="badge">embedding</span>`);
+  if (canThink(m)) notes.push(`<span class="badge">thinking: ${esc(m.config.thinking || 'model default')}</span>`);
+  else if (m.specs?.thinking_support === 'always') notes.push(`<span class="badge">always thinks</span>`);
+  if (m.config.opencode_provider) notes.push(`<span class="badge">opencode: ${esc(m.config.opencode_provider)}</span>`);
+  if (st.started && running) notes.push(`<span class="sub">up ${age(st.started)}</span>`);
+  el.querySelector('[data-notes]').innerHTML = notes.join('');
+  el.querySelector('[data-cmd]').textContent = m.command;
+  renderSpecs(el, m);
+}
+
+const gb = n => n == null ? '?' : n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : `${Math.round(n / 1e6)} MB`;
+const kctx = n => !n ? '?' : n % 1024 === 0 ? `${n / 1024}k` : String(n);
+
+function renderSpecs(el, m) {
+  const s = m.specs || {}, line = el.querySelector('[data-specs]'), full = el.querySelector('[data-specs-full]');
+  if (s.error) { line.innerHTML = ''; full.innerHTML = `<span class="err">${esc(s.error)}</span>`; return; }
+  const kvType = m.config.cache_type_k || 'f16';
+  line.innerHTML = [s.size_label, s.quant, gb(s.file_bytes), `trained ${kctx(s.trained_ctx)} ctx`,
+    `KV ~${gb(s.kv_cache_bytes)}`].filter(Boolean).map(esc).join(' · ')
+    + ` · <b>~${gb(s.est_memory_bytes)} total</b>`
+    + s.warnings.map(w => `<div class="warn">${esc(w)}</div>`).join('');
+  const rows = [
+    ['name', s.name], ['architecture', s.architecture], ['size', s.size_label], ['quantization', s.quant],
+    ['file size', gb(s.file_bytes) + (s.files > 1 ? ` (${s.files} files)` : '')], ['tensors', s.tensors],
+    ['trained context', s.trained_ctx], ['configured context', m.config.ctx_size],
+    ['layers', s.attention_layers !== s.layers ? `${s.layers} (${s.attention_layers} attention)` : s.layers],
+    ['embedding length', s.embedding_length], ['heads / kv heads', `${s.heads ?? '?'} / ${s.kv_heads ?? '?'}`],
+    ['head dim (k / v)', `${s.key_length ?? '?'} / ${s.value_length ?? '?'}`],
+    ...(s.experts ? [['experts', `${s.experts} (${s.experts_used} active)`]] : []),
+    ['chat template', s.chat_template ? 'yes' : 'no'],
+    ['thinking', { toggle: 'switchable', always: 'always on', none: 'no' }[s.thinking_support]],
+    [`KV cache (${kvType})`, '~' + gb(s.kv_cache_bytes)], ['est. memory', `~${gb(s.est_memory_bytes)} + compute buffers`],
+  ];
+  full.innerHTML = rows.map(([k, v]) => `<span>${esc(k)}</span><span class="mono">${esc(v ?? '?')}</span>`).join('');
+}
+
+function age(ts) {
+  const s = Math.floor(Date.now() / 1000 - ts);
+  return s >= 3600 ? `${Math.floor(s / 3600)}h${String(Math.floor(s % 3600 / 60)).padStart(2, '0')}m` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`;
+}
+
+function apply(s) {
+  STATE = s;
+  const b = document.getElementById('binary');
+  b.textContent = s.binary ? `llama-server: ${s.binary}` : s.binary_error;
+  b.className = 'binary' + (s.binary ? '' : ' err');
+  const gw = s.gateway;
+  $('gateway').className = `pill st-${gw.state === 'running' ? 'ready' : 'stopped'}`;
+  $('gateway-label').textContent = gw.state === 'running' ? `gateway ${gw.url}` : 'gateway stopped';
+  $('btn-gateway').textContent = gw.state === 'running' ? 'stop' : 'start';
+  const grid = document.getElementById('grid');
+  const ids = s.models.map(m => m.id);
+  for (const id of Object.keys(cards)) if (!ids.includes(id)) { cards[id].el.remove(); delete cards[id]; }
+  for (const m of s.models) {
+    if (!cards[m.id]) grid.appendChild(mountCard(m));
+    else if (!cards[m.id].dirty) {
+      // refresh form values only if the card isn't being edited
+      const focused = cards[m.id].el.contains(document.activeElement);
+      if (!focused) syncForm(m);
+    }
+    updateStatus(m);
+  }
+}
+
+function syncForm(m) {
+  const el = cards[m.id].el;
+  el.querySelectorAll('[data-key]').forEach(inp => {
+    const v = m.config[inp.dataset.key];
+    if (inp.type === 'checkbox') inp.checked = !!v; else inp.value = v ?? '';
+  });
+  el.querySelector('h2').textContent = m.config.name;
+}
+
+async function refresh() {
+  try { apply(await api('/api/state')); } catch (e) { document.getElementById('binary').textContent = 'UI server not reachable'; }
+}
+
+// ---------------------------------------------------------------- dialogs
+async function openLogs(id) {
+  logsFor = id;
+  document.getElementById('logs-title').textContent = `Logs — ${id}`;
+  const dlg = document.getElementById('dlg-logs'); dlg.showModal();
+  const pre = document.getElementById('logs-pre');
+  const load = async () => {
+    try {
+      const r = await api(`/api/models/${encodeURIComponent(id)}/logs?n=500`);
+      const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 30;
+      pre.textContent = r.log || '(no log yet)';
+      document.getElementById('logs-path').textContent = r.path;
+      if (atBottom || !pre.dataset.loaded) pre.scrollTop = pre.scrollHeight;
+      pre.dataset.loaded = 1;
+    } catch (e) { pre.textContent = e.message; }
+  };
+  delete pre.dataset.loaded;
+  await load();
+  clearInterval(logsTimer);
+  logsTimer = setInterval(() => { if (document.getElementById('logs-follow').checked) load(); }, 1500);
+}
+document.getElementById('dlg-logs').addEventListener('close', () => clearInterval(logsTimer));
+
+// ---------------------------------------------------------------- chat / embedding test
+const chats = {};            // id -> {messages: [], prevVec}
+let chatFor = null, chatAbort = null;
+const $ = id => document.getElementById(id);
+
+function chatModel() { return STATE.models.find(x => x.id === chatFor); }
+
+function addMsg(role, text) {
+  const d = document.createElement('div');
+  d.className = `msg ${role}`; d.textContent = text;
+  $('chat-log').appendChild(d); $('chat-log').scrollTop = $('chat-log').scrollHeight;
+  return d;
+}
+
+function openChat(id) {
+  chatFor = id;
+  const m = chatModel(), emb = m.config.embedding;
+  chats[id] ||= { messages: [], prevVec: null };
+  $('chat-title').textContent = `${emb ? 'Embedding test' : 'Chat'} — ${id}`;
+  $('chat-opts').style.display = emb ? 'none' : '';
+  $('chat-think-wrap').style.display = canThink(m) ? '' : 'none';
+  $('chat-think').value = '';
+  $('chat-text').placeholder = emb ? 'Text to embed — each one is compared to the previous (cosine similarity)'
+                                   : 'Message — Enter to send, Shift+Enter for a new line';
+  $('chat-log').innerHTML = ''; $('chat-stats').textContent = '';
+  for (const msg of chats[id].messages) addMsg(msg.role, msg.content);
+  $('dlg-chat').showModal(); $('chat-text').focus();
+}
+
+function setBusy(busy) {
+  $('chat-send').textContent = busy ? 'Stop' : 'Send';
+  $('chat-send').classList.toggle('primary', !busy);
+}
+
+async function sendChat() {
+  if (chatAbort) { chatAbort.abort(); return; }
+  const text = $('chat-text').value.trim(); if (!text) return;
+  const m = chatModel(), chat = chats[chatFor], path = `/api/models/${encodeURIComponent(chatFor)}/proxy/v1/`;
+  $('chat-text').value = '';
+  addMsg('user', text);
+  chatAbort = new AbortController(); setBusy(true);
+  const t0 = performance.now();
+  try {
+    if (m.config.embedding) {
+      const r = await fetch(path + 'embeddings', { method: 'POST', signal: chatAbort.signal,
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'llmctl' },
+        body: JSON.stringify({ model: m.config.alias || 'local', input: text }) });
+      const j = await r.json(); if (!r.ok) throw new Error(j.error || r.statusText);
+      const v = j.data[0].embedding, norm = Math.hypot(...v);
+      let out = `dim ${v.length} · norm ${norm.toFixed(4)}\n[${v.slice(0, 6).map(x => x.toFixed(4)).join(', ')}, …]`;
+      if (chat.prevVec) {
+        const p = chat.prevVec, dot = v.reduce((s, x, i) => s + x * p[i], 0);
+        out += `\ncosine similarity to previous: ${(dot / (norm * Math.hypot(...p))).toFixed(4)}`;
+      }
+      chat.prevVec = v;
+      addMsg('assistant', out);
+      $('chat-stats').textContent = `${((performance.now() - t0) / 1000).toFixed(2)}s`;
+      return;
+    }
+    chat.messages.push({ role: 'user', content: text });
+    const sys = $('chat-system').value.trim(), temp = $('chat-temp').value.trim(), max = parseInt($('chat-max').value);
+    const body = { model: m.config.alias || 'local', stream: true,
+      messages: [...(sys ? [{ role: 'system', content: sys }] : []), ...chat.messages] };
+    if (temp) body.temperature = parseFloat(temp);
+    if (max) body.max_tokens = max;
+    if (canThink(m) && $('chat-think').value) body.chat_template_kwargs = { enable_thinking: $('chat-think').value === 'on' };
+    const r = await fetch(path + 'chat/completions', { method: 'POST', signal: chatAbort.signal,
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'llmctl' }, body: JSON.stringify(body) });
+    if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || r.statusText); }
+
+    const bubble = addMsg('assistant', ''), textNode = document.createTextNode('');
+    let thinking = null, content = '', timings = null, buf = '';
+    bubble.appendChild(textNode);
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    try {
+      while (true) {
+        const { value, done } = await reader.read(); if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split('\n'); buf = lines.pop();
+        for (const line of lines) {
+          if (!line.startsWith('data:')) continue;
+          const data = line.slice(5).trim(); if (data === '[DONE]') continue;
+          const j = JSON.parse(data);
+          if (j.timings) timings = j.timings;
+          const d = j.choices?.[0]?.delta || {};
+          if (d.reasoning_content) {
+            if (!thinking) {
+              thinking = document.createElement('details'); thinking.open = true;
+              thinking.innerHTML = '<summary>thinking</summary><span></span>';
+              bubble.insertBefore(thinking, textNode);
+            }
+            thinking.querySelector('span').textContent += d.reasoning_content;
+          }
+          if (d.content) {
+            if (thinking && thinking.open && !content) thinking.open = false;
+            content += d.content; textNode.textContent = content;
+          }
+          $('chat-log').scrollTop = $('chat-log').scrollHeight;
+        }
+      }
+    } catch (e) { if (e.name !== 'AbortError') throw e; content += content ? '' : '[stopped]'; }
+    chat.messages.push({ role: 'assistant', content });
+    const wall = ((performance.now() - t0) / 1000).toFixed(1);
+    $('chat-stats').textContent = timings
+      ? `${timings.predicted_n} tokens @ ${timings.predicted_per_second.toFixed(1)} tok/s · prompt ${timings.prompt_n} tokens @ ${Math.round(timings.prompt_per_second)} tok/s · ${wall}s`
+      : `${wall}s`;
+  } catch (e) {
+    if (e.name === 'AbortError') addMsg('error', 'stopped');
+    else { addMsg('error', e.message); if (chat.messages.at(-1)?.role === 'user') chat.messages.pop(); }
+  } finally { chatAbort = null; setBusy(false); }
+}
+
+$('chat-form').addEventListener('submit', e => { e.preventDefault(); sendChat(); });
+$('chat-text').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); } });
+$('chat-clear').onclick = () => { chats[chatFor] = { messages: [], prevVec: null }; $('chat-log').innerHTML = ''; $('chat-stats').textContent = ''; };
+$('dlg-chat').addEventListener('close', () => { if (chatAbort) chatAbort.abort(); });
+
+document.getElementById('btn-add').onclick = () => {
+  const sel = document.getElementById('add-from');
+  sel.innerHTML = '<option value="">(blank model)</option>' + STATE.models.map(m => `<option value="${esc(m.id)}">${esc(m.id)}</option>`).join('');
+  document.getElementById('add-id').value = '';
+  document.getElementById('dlg-add').showModal();
+};
+document.getElementById('dlg-add').addEventListener('close', async e => {
+  if (e.target.returnValue !== 'ok') return;
+  const id = document.getElementById('add-id').value.trim();
+  const s = await act(() => post('/api/models', { id, from: document.getElementById('add-from').value }), `added ${id}`);
+  if (s && cards[id]) { cards[id].el.querySelector('details').open = true; cards[id].el.scrollIntoView({ behavior: 'smooth' }); }
+});
+
+document.getElementById('btn-global').onclick = () => {
+  const f = document.getElementById('global-form');
+  for (const [k, v] of Object.entries(STATE.global)) if (f.elements[k]) f.elements[k].value = String(v);
+  document.getElementById('config-path').textContent = STATE.config_path;
+  document.getElementById('dlg-global').showModal();
+};
+document.getElementById('dlg-global').addEventListener('close', e => {
+  if (e.target.returnValue !== 'ok') return;
+  const f = document.getElementById('global-form'), body = {};
+  for (const el of f.elements) if (el.name) body[el.name] = el.value;
+  act(() => post('/api/global', body), 'saved');
+});
+
+document.getElementById('btn-opencode').onclick = async () => {
+  try {
+    const r = await api('/api/opencode');
+    document.getElementById('opencode-path').textContent = r.path + (r.exists ? '' : ' (will be created)');
+    document.getElementById('opencode-pre').textContent = JSON.stringify(r.proposed, null, 2);
+    document.getElementById('dlg-opencode').showModal();
+  } catch (e) { toast(e.message, true); }
+};
+document.getElementById('opencode-write').onclick = async () => {
+  try {
+    const r = await post('/api/opencode');
+    toast(`wrote ${r.path}` + (r.backup ? `\nbackup: ${r.backup}` : ''));
+    document.getElementById('dlg-opencode').close();
+  } catch (e) { toast(e.message, true); }
+};
+
+$('btn-gateway').onclick = () => act(() => post(`/api/gateway/${STATE.gateway.state === 'running' ? 'stop' : 'start'}`));
+document.getElementById('btn-autostart').onclick = () => act(() => post('/api/start-autostart'), 'starting autostart models…');
+document.getElementById('btn-stopall').onclick = () => { if (confirm('Stop all running models?')) act(() => post('/api/stop-all'), 'stopped all'); };
+
+const dl = document.createElement('datalist'); dl.id = 'ctx-presets';
+dl.innerHTML = CTX_PRESETS.map(v => `<option value="${v}">${v / 1024}k</option>`).join('');
+document.body.appendChild(dl);
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

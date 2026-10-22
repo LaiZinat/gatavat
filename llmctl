@@ -1,0 +1,1744 @@
+#!/usr/bin/env python3
+"""llmctl - configure, start and stop local llama.cpp (llama-server) models.
+
+One CLI and one small web UI sharing the same config file and process state, so a
+model started from the UI can be stopped from the CLI and vice versa. Servers run
+detached: closing the UI or the terminal does not stop them.
+
+Only the Python standard library is used.
+
+Author: Dr. Leonhard Horstmeyer <mail@leonhardhorstmeyer.com>
+License: MIT
+"""
+import argparse
+import copy
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+__version__ = "0.1.0"
+__author__ = "Dr. Leonhard Horstmeyer <mail@leonhardhorstmeyer.com>"
+
+HOME_DIR = Path(os.environ.get("LLMCTL_HOME", "~/.config/llmctl")).expanduser()
+CONFIG_PATH = HOME_DIR / "config.json"
+RUN_DIR = HOME_DIR / "run"
+LOG_DIR = HOME_DIR / "logs"
+UI_HTML = Path(__file__).resolve().parent / "ui.html"
+LOG_ROTATE_BYTES = 20 * 1024 * 1024
+
+
+# --------------------------------------------------------------------------- settings schema
+
+def F(key, type, flag=None, group="General", help="", choices=None):
+    return {"key": key, "type": type, "flag": flag, "group": group, "help": help, "choices": choices}
+
+
+# Order matters: it is the order of flags on the command line and of fields in the UI.
+FIELDS = [
+    F("name", "str", None, "General", "Display name"),
+    F("model", "path", "-m", "General", "Path to the .gguf file. Supports ~, $VAR and ${VAR:-default}"),
+    F("alias", "str", "--alias", "General", "Model id exposed on /v1/models"),
+    F("host", "str", "--host", "General", "127.0.0.1 = this machine only, 0.0.0.0 = whole network"),
+    F("port", "int", "--port", "General"),
+    F("ctx_size", "int", "--ctx-size", "General", "Context window in tokens"),
+    F("autostart", "bool", None, "General", "Started by `llmctl start` with no arguments"),
+    F("ngl", "int", "-ngl", "Performance", "Layers offloaded to the GPU (999 = all)"),
+    F("threads", "threads", "--threads", "Performance", "CPU threads: a number, or 'auto' for all cores"),
+    F("parallel", "int", "--parallel", "Performance", "Parallel request slots (blank = llama.cpp default)"),
+    F("batch_size", "int", "--batch-size", "Performance", "Logical batch size"),
+    F("ubatch_size", "int", "--ubatch-size", "Performance", "Physical batch size"),
+    F("flash_attn", "choice", "--flash-attn", "Performance", "Flash attention", ["on", "off", "auto"]),
+    F("cache_type_k", "choice", "--cache-type-k", "Performance", "KV cache type for K (quantize to save memory)",
+      ["f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0"]),
+    F("cache_type_v", "choice", "--cache-type-v", "Performance", "KV cache type for V (needs flash attention)",
+      ["f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0"]),
+    F("jinja", "bool", "--jinja", "Mode", "Use the model's Jinja chat template (needed for tool calling)"),
+    F("embedding", "bool", "--embedding", "Mode", "Serve embeddings only"),
+    F("thinking", "choice", None, "Mode", "Thinking/reasoning for hybrid models such as Qwen3.6 "
+      "(blank = model default). Only shown when the chat template supports switching it", ["on", "off"]),
+    F("pooling", "choice", "--pooling", "Mode", "Embedding pooling (embedding models only)",
+      ["none", "mean", "cls", "last", "rank"]),
+    F("temp", "float", "--temp", "Sampling defaults", "Default temperature (clients can override)"),
+    F("top_p", "float", "--top-p", "Sampling defaults"),
+    F("top_k", "int", "--top-k", "Sampling defaults"),
+    F("min_p", "float", "--min-p", "Sampling defaults"),
+    F("repeat_penalty", "float", "--repeat-penalty", "Sampling defaults"),
+    F("extra_args", "str", None, "Advanced", "Any other llama-server flags, e.g. --mlock --no-mmap"),
+    F("opencode_provider", "str", None, "opencode", "Blank = not in opencode.json. Gateway mode: any value "
+      "includes the model in the shared provider. Per-model mode: this model's own provider id"),
+    F("opencode_output", "int", None, "opencode", "Max output tokens advertised to opencode"),
+]
+FIELD_BY_KEY = {f["key"]: f for f in FIELDS}
+
+DEFAULT_GLOBAL = {
+    "llama_server": "${LLAMA_SERVER:-llama-server}",
+    "ui_host": "127.0.0.1",
+    "ui_port": 8090,
+    "opencode_path": "~/.config/opencode/opencode.json",
+    # One OpenAI-compatible endpoint for all models, routed by the request's "model" field.
+    "gateway_host": "127.0.0.1",
+    "gateway_port": 8100,
+    "gateway_autostart": True,
+    # "gateway": one opencode provider (opencode_provider_id) for all models, via the gateway.
+    # "per-model": one provider per model, each pointing at its own port.
+    "opencode_mode": "gateway",
+    "opencode_provider_id": "llama-local",
+}
+
+
+def set_global(cfg, key, value):
+    if key not in DEFAULT_GLOBAL:
+        raise UserError(f"unknown global setting {key!r} ({', '.join(DEFAULT_GLOBAL)})")
+    default = DEFAULT_GLOBAL[key]
+    if isinstance(default, bool):
+        value = coerce({"type": "bool", "key": key, "choices": None}, value)
+    elif isinstance(default, int):
+        value = coerce({"type": "int", "key": key, "choices": None}, value)
+    else:
+        value = str(value).strip()
+    if key == "opencode_mode" and value not in ("gateway", "per-model"):
+        raise UserError("opencode_mode must be 'gateway' or 'per-model'")
+    cfg["global"][key] = value
+
+
+def _model(**kw):
+    m = {f["key"]: None for f in FIELDS}
+    m.update(autostart=False, jinja=False, embedding=False)
+    m.update(kw)
+    return m
+
+
+# Ports: 8100 + i, i = 1, 2, ... in the order below. Models added later get the next free one.
+DEFAULT_MODELS = {
+    "qwen25-14b": _model(
+        name="Qwen 2.5 14B Instruct Q4_K_M",
+        model="${QWEN_MODELS:-$HOME/Models/LLM/Qwen2.5-14B-Instruct}/qwen2.5-14b-instruct-q4_k_m.gguf",
+        alias="qwen2.5-14b-instruct", host="127.0.0.1", port=8101, ctx_size=8192, threads="auto",
+        jinja=True, opencode_provider="llama-qwen25-14b", opencode_output=4096,
+    ),
+    "qwen25-32b": _model(
+        name="Qwen 2.5 32B Instruct",
+        model="$HOME/Models/LLM/Qwen2.5-32B-Instruct/qwen2.5-32b-instruct-q4_k_m-00001-of-00005.gguf",
+        alias="qwen2.5-32b-instruct", host="127.0.0.1", port=8102, ctx_size=32768, ngl=999,
+        threads="auto", jinja=True, opencode_provider="llama-qwen25", opencode_output=8192,
+    ),
+    "qwen3-coder": _model(
+        name="Qwen3-Coder-Next Q4_K_M",
+        model="${CODER_MODEL:-$HOME/Models/LLM/Qwen3-Coder-Next/Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-Q4_K_M-00001-of-00004.gguf}",
+        alias="qwen3-coder-next", host="127.0.0.1", port=8103, ctx_size=65536, ngl=999,
+        threads="auto", jinja=True, autostart=True, opencode_provider="llama-coder", opencode_output=8192,
+    ),
+    "qwen36-35b": _model(
+        name="Qwen3.6-35B-A3B Q8_0",
+        model="${OPENHANDS_MODEL:-$HOME/Models/LLM/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q8_0.gguf}",
+        alias="qwen3.6-35b-a3b", host="127.0.0.1", port=8104, ctx_size=32768, ngl=999,
+        threads="auto", jinja=True, opencode_provider="llama-qwen36", opencode_output=8192,
+    ),
+    "qwen3-embedding": _model(
+        name="Qwen3-Embedding-8B f16",
+        model="${EMBEDDING_MODEL:-$HOME/Models/Embedding/Qwen3-Embedding-8B/Qwen3-Embedding-8B-f16.gguf}",
+        alias="qwen3-embedding", host="127.0.0.1", port=8105, ctx_size=8192, ngl=999,
+        embedding=True, pooling="last",
+    ),
+}
+
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_VAR_RE = re.compile(r"\$\{(\w+)(?::-([^}]*))?\}|\$(\w+)")
+
+
+def expand(s):
+    """Expand ~, $VAR, ${VAR} and ${VAR:-default} (default may itself contain $VAR)."""
+    if not s:
+        return s
+
+    def rep(m):
+        name = m.group(1) or m.group(3)
+        val = os.environ.get(name)
+        if val:
+            return val
+        if m.group(2) is not None:
+            return expand(m.group(2))
+        return m.group(0)
+
+    return os.path.expanduser(_VAR_RE.sub(rep, s))
+
+
+def model_path(raw):
+    """Expand a model path. If `X.gguf` doesn't exist but a split model does, use its first part:
+    `X-00001-of-N.gguf` next to it, or inside a folder named `X`."""
+    p = expand(raw or "")
+    if not p or os.path.isfile(p) or not p.endswith(".gguf"):
+        return p
+    base = p[:-len(".gguf")]
+    folder, stem = os.path.split(base)
+    for d in (folder, base):
+        hits = sorted(glob.glob(os.path.join(glob.escape(d), glob.escape(stem) + "-00001-of-*.gguf")))
+        if hits:
+            return hits[0]
+    return p
+
+
+# --------------------------------------------------------------------------- config
+
+class UserError(Exception):
+    pass
+
+
+def coerce(field, v):
+    """Turn a JSON or CLI string value into the field's type. Blank means unset (None)."""
+    t, key = field["type"], field["key"]
+    if isinstance(v, str):
+        v = v.strip()
+        if t != "bool" and v.lower() in ("", "null", "none", "default"):
+            return None
+    if v is None:
+        return False if t == "bool" else None
+    try:
+        if t in ("str", "path"):
+            return str(v)
+        if t == "bool":
+            if isinstance(v, bool):
+                return v
+            s = str(v).lower()
+            if s in ("1", "true", "yes", "on", "y"):
+                return True
+            if s in ("0", "false", "no", "off", "n", ""):
+                return False
+            raise ValueError
+        if t == "int":
+            if isinstance(v, bool):
+                raise ValueError
+            return int(v)
+        if t == "float":
+            return float(v)
+        if t == "threads":
+            return "auto" if str(v).lower() == "auto" else int(v)
+        if t == "choice":
+            if v not in field["choices"]:
+                raise ValueError
+            return v
+    except (TypeError, ValueError):
+        pass
+    hint = f" (one of: {', '.join(field['choices'])})" if field["choices"] else f" (expected {t})"
+    raise UserError(f"invalid value for {key}: {v!r}{hint}")
+
+
+def normalize_model(m):
+    out = {}
+    for f in FIELDS:
+        out[f["key"]] = coerce(f, m.get(f["key"]))
+    return out
+
+
+def validate_model(mid, m):
+    if not ID_RE.match(mid or ""):
+        raise UserError(f"invalid model id {mid!r} (letters, digits, . _ -)")
+    if not m.get("model"):
+        raise UserError(f"{mid}: 'model' (path to .gguf) is required")
+    if not m.get("port") or not 1 <= m["port"] <= 65535:
+        raise UserError(f"{mid}: 'port' must be 1-65535")
+    if not m.get("ctx_size") or m["ctx_size"] < 1:
+        raise UserError(f"{mid}: 'ctx_size' must be a positive number")
+    if not m.get("host"):
+        m["host"] = "127.0.0.1"
+    if not m.get("name"):
+        m["name"] = mid
+    if m.get("extra_args"):
+        try:
+            shlex.split(m["extra_args"])
+        except ValueError as e:
+            raise UserError(f"{mid}: extra_args: {e}")
+    return m
+
+
+def default_config():
+    return {"global": dict(DEFAULT_GLOBAL), "models": copy.deepcopy(DEFAULT_MODELS)}
+
+
+_config_lock = threading.Lock()
+
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        cfg = default_config()
+        save_config(cfg)
+        return cfg
+    try:
+        raw = json.loads(CONFIG_PATH.read_text())
+    except json.JSONDecodeError as e:
+        raise UserError(f"{CONFIG_PATH} is not valid JSON: {e}")
+    g = dict(DEFAULT_GLOBAL)
+    g.update(raw.get("global") or {})
+    models = {mid: normalize_model(m) for mid, m in (raw.get("models") or {}).items()}
+    return {"global": g, "models": models}
+
+
+def save_config(cfg):
+    HOME_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cfg, indent=2) + "\n")
+    tmp.replace(CONFIG_PATH)
+
+
+def next_free_port(cfg):
+    used = {m.get("port") for m in cfg["models"].values()}
+    return next(p for p in range(8106, 9000) if p not in used)
+
+
+def get_model(cfg, mid):
+    if mid not in cfg["models"]:
+        known = ", ".join(cfg["models"]) or "none"
+        raise UserError(f"unknown model {mid!r} (known: {known})")
+    return cfg["models"][mid]
+
+
+def apply_settings(m, pairs):
+    """pairs: iterable of (key, raw value)."""
+    m = dict(m)
+    for key, val in pairs:
+        if key not in FIELD_BY_KEY:
+            raise UserError(f"unknown setting {key!r}. Settings: {', '.join(FIELD_BY_KEY)}")
+        m[key] = coerce(FIELD_BY_KEY[key], val)
+    return m
+
+
+def parse_pairs(items):
+    pairs = []
+    for it in items:
+        if "=" not in it:
+            raise UserError(f"expected key=value, got {it!r}")
+        k, v = it.split("=", 1)
+        pairs.append((k.strip().replace("-", "_"), v))
+    return pairs
+
+
+# --------------------------------------------------------------------------- command line building
+
+def resolve_binary(g):
+    b = expand(g.get("llama_server") or "llama-server")
+    if "/" in b:
+        if os.path.isfile(b) and os.access(b, os.X_OK):
+            return b
+        raise UserError(f"llama-server not found at {b}")
+    found = shutil.which(b)
+    if found:
+        return found
+    for d in ("/opt/homebrew/bin", "/usr/local/bin", os.path.expanduser("~/.local/bin")):
+        p = os.path.join(d, b)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    raise UserError(f"'{b}' not found on PATH; set the llama-server path with "
+                    f"`llmctl global llama_server=/path/to/llama-server`")
+
+
+def build_cmd(m, g, resolve=True):
+    if resolve:
+        binary = resolve_binary(g)
+    else:
+        try:
+            binary = resolve_binary(g)
+        except UserError:
+            binary = expand(g.get("llama_server") or "llama-server")
+    cmd = [binary]
+    for f in FIELDS:
+        flag, v = f["flag"], m.get(f["key"])
+        if not flag or v is None or v is False:
+            continue
+        if f["key"] == "pooling" and not m.get("embedding"):
+            continue
+        if f["type"] == "bool":
+            cmd.append(flag)
+            continue
+        if f["key"] == "model":
+            v = model_path(v)
+        elif f["key"] == "threads" and v == "auto":
+            v = os.cpu_count() or 4
+        cmd += [flag, str(v)]
+    if m.get("thinking"):
+        cmd += thinking_args(m["thinking"], binary)
+    if m.get("extra_args"):
+        cmd += shlex.split(m["extra_args"])
+    return cmd
+
+
+FLAGS_CACHE = HOME_DIR / "server-flags.json"
+
+
+def server_flags(binary):
+    """Flags the llama-server binary knows (from --help), cached per binary path + mtime."""
+    try:
+        key = f"{binary}:{os.stat(binary).st_mtime}"
+    except OSError:
+        return set()
+    try:
+        cache = json.loads(FLAGS_CACHE.read_text())
+    except (OSError, json.JSONDecodeError):
+        cache = {}
+    if key not in cache:
+        try:
+            out = subprocess.run([binary, "--help"], capture_output=True, text=True, timeout=20)
+            text = out.stdout + out.stderr
+        except Exception:
+            return set()
+        cache = {key: sorted(set(re.findall(r"--[a-z0-9][a-z0-9-]*", text)))}
+        try:
+            HOME_DIR.mkdir(parents=True, exist_ok=True)
+            FLAGS_CACHE.write_text(json.dumps(cache))
+        except OSError:
+            pass
+    return set(cache[key])
+
+
+def thinking_args(value, binary):
+    """Server flags for thinking on/off, using whichever mechanism this llama-server build has."""
+    flags = server_flags(binary)
+    if "--reasoning-budget" in flags or not flags:
+        return ["--reasoning-budget", "-1" if value == "on" else "0"]
+    if "--reasoning" in flags:
+        return ["--reasoning", value]
+    return ["--chat-template-kwargs", json.dumps({"enable_thinking": value == "on"})]
+
+
+def client_host(m):
+    h = m.get("host") or "127.0.0.1"
+    return "127.0.0.1" if h in ("0.0.0.0", "::", "") else h
+
+
+# --------------------------------------------------------------------------- process management
+
+def run_file(mid):
+    return RUN_DIR / f"{mid}.json"
+
+
+def log_file(mid):
+    return LOG_DIR / f"{mid}.log"
+
+
+def read_run(mid):
+    p = run_file(mid)
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def pid_alive(run):
+    pid = run["pid"]
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    # Guard against pid reuse: the process must still look like our server.
+    try:
+        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                             capture_output=True, text=True, timeout=2).stdout
+    except Exception:
+        return True
+    return os.path.basename(run["cmd"][0]) in out and "<defunct>" not in out
+
+
+def health(m, timeout=0.5):
+    url = f"http://{client_host(m)}:{m['port']}/health"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return "ready" if r.status == 200 else "loading"
+    except urllib.error.HTTPError as e:
+        return "loading" if e.code == 503 else "error"
+    except Exception:
+        return None
+
+
+def port_in_use(host, port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.3)
+        return s.connect_ex((host, port)) == 0
+
+
+def model_status(mid, m, g):
+    path = model_path(m.get("model"))
+    st = {
+        "state": "stopped",
+        "model_path": path,
+        "model_found": os.path.isfile(path),
+        "url": f"http://{client_host(m)}:{m['port']}/v1",
+    }
+    run = read_run(mid)
+    if not run:
+        return st
+    if not pid_alive(run):
+        st.update(state="exited", started=run.get("started"))
+        return st
+    h = health(m)
+    st.update(
+        state=h if h in ("ready", "loading") else "starting",
+        pid=run["pid"],
+        started=run.get("started"),
+        # Config saved after start (or one-off overrides) -> running server differs.
+        stale=run.get("cmd", [])[1:] != build_cmd(m, g, resolve=False)[1:],
+    )
+    return st
+
+
+def _rotate_log(path):
+    try:
+        if path.stat().st_size > LOG_ROTATE_BYTES:
+            path.replace(path.with_suffix(".log.1"))
+    except FileNotFoundError:
+        pass
+
+
+def start_model(cfg, mid, m=None):
+    """Start a model detached. `m` may carry one-off overrides; defaults to saved config."""
+    g = cfg["global"]
+    m = validate_model(mid, dict(m or get_model(cfg, mid)))
+    run = read_run(mid)
+    if run and pid_alive(run):
+        raise UserError(f"{mid} is already running (pid {run['pid']})")
+    path = model_path(m["model"])
+    if not os.path.isfile(path):
+        raise UserError(f"{mid}: model file not found: {path}")
+    for other_id, other in cfg["models"].items():
+        if other_id != mid and other["port"] == m["port"]:
+            orun = read_run(other_id)
+            if orun and pid_alive(orun):
+                raise UserError(f"{mid}: port {m['port']} is used by running model {other_id}")
+    if port_in_use(client_host(m), m["port"]):
+        raise UserError(f"{mid}: something is already listening on port {m['port']}")
+    cmd = build_cmd(m, g)
+
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    lp = log_file(mid)
+    _rotate_log(lp)
+    logf = open(lp, "ab")
+    logf.write(f"\n===== llmctl start {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n"
+               f"$ {shlex.join(cmd)}\n".encode())
+    logf.flush()
+    proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                            start_new_session=True, close_fds=True)
+    logf.close()
+    # Reap the child if this process lives on (the UI); harmless for the CLI.
+    threading.Thread(target=proc.wait, daemon=True).start()
+    run_file(mid).write_text(json.dumps({"pid": proc.pid, "cmd": cmd, "started": time.time()}))
+    time.sleep(0.4)
+    if proc.poll() is not None:
+        run_file(mid).unlink(missing_ok=True)
+        raise UserError(f"{mid}: llama-server exited immediately (code {proc.returncode}).\n"
+                        f"{tail(lp, 15)}")
+    if g.get("gateway_autostart") and gateway_status(cfg)["state"] != "running":
+        try:
+            gateway_start(cfg)
+        except UserError as e:
+            print(f"warning: gateway not started: {e}", file=sys.stderr)
+    return proc.pid
+
+
+def stop_model(mid, timeout=15):
+    run = read_run(mid)
+    if not run:
+        return False
+    was_alive = pid_alive(run)
+    if was_alive:
+        pid = run["pid"]
+        for sig, wait in ((signal.SIGTERM, timeout), (signal.SIGKILL, 5)):
+            try:
+                os.killpg(pid, sig)
+            except ProcessLookupError:
+                break
+            except PermissionError:
+                os.kill(pid, sig)
+            deadline = time.time() + wait
+            while time.time() < deadline and pid_alive(run):
+                time.sleep(0.2)
+            if not pid_alive(run):
+                break
+    run_file(mid).unlink(missing_ok=True)
+    return was_alive
+
+
+def wait_ready(cfg, mid, timeout=600, quiet=False):
+    m = get_model(cfg, mid)
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        run = read_run(mid)
+        if not run or not pid_alive(run):
+            raise UserError(f"{mid} exited while loading. Last log lines:\n{tail(log_file(mid), 20)}")
+        if health(m) == "ready":
+            return True
+        if not quiet:
+            print(f"\r  {mid}: loading... {int(time.time() - t0)}s", end="", flush=True)
+        time.sleep(1)
+    raise UserError(f"{mid}: not ready after {timeout}s")
+
+
+def tail(path, n=100):
+    path = Path(path)
+    if not path.exists():
+        return ""
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        f.seek(max(0, size - max(8192, n * 400)))
+        data = f.read().decode(errors="replace")
+    return "\n".join(data.splitlines()[-n:])
+
+
+# --------------------------------------------------------------------------- model specs (GGUF metadata)
+
+GGUF_FTYPES = {
+    0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 7: "Q8_0", 8: "Q5_0", 9: "Q5_1", 10: "Q2_K", 11: "Q3_K_S",
+    12: "Q3_K_M", 13: "Q3_K_L", 14: "Q4_K_S", 15: "Q4_K_M", 16: "Q5_K_S", 17: "Q5_K_M", 18: "Q6_K",
+    19: "IQ2_XXS", 20: "IQ2_XS", 21: "Q2_K_S", 22: "IQ3_XS", 23: "IQ3_XXS", 24: "IQ1_S", 25: "IQ4_NL",
+    26: "IQ3_S", 27: "IQ3_M", 28: "IQ2_S", 29: "IQ2_M", 30: "IQ4_XS", 31: "IQ1_M", 32: "BF16",
+    36: "TQ1_0", 37: "TQ2_0", 38: "MXFP4_MOE",
+}
+_GGUF_SCALAR = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?",
+                10: "<Q", 11: "<q", 12: "<d"}
+# Bytes per KV-cache element for each --cache-type.
+KV_BYTES = {None: 2, "f16": 2, "bf16": 2, "q8_0": 34 / 32, "q5_1": 24 / 32, "q5_0": 22 / 32,
+            "q4_1": 20 / 32, "q4_0": 18 / 32}
+_SPLIT_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
+_spec_cache = {}
+
+
+def gguf_metadata(path):
+    """Read the GGUF key/value header. Big arrays (tokenizer vocab) are skipped, not loaded."""
+    import struct
+    with open(path, "rb") as f:
+        def rd(fmt):
+            return struct.unpack(fmt, f.read(struct.calcsize(fmt)))[0]
+
+        def rstr():
+            return f.read(rd("<Q")).decode("utf-8", "replace")
+
+        def rval(t):
+            if t == 8:
+                return rstr()
+            if t == 9:
+                et, n = rd("<I"), rd("<Q")
+                if et in _GGUF_SCALAR and n <= 1024:  # small arrays, e.g. per-layer head counts
+                    return [rval(et) for _ in range(n)]
+                if et in _GGUF_SCALAR:
+                    f.seek(n * struct.calcsize(_GGUF_SCALAR[et]), 1)
+                elif et == 8:
+                    for _ in range(n):
+                        f.seek(rd("<Q"), 1)
+                else:
+                    for _ in range(n):
+                        rval(et)
+                return None
+            return rd(_GGUF_SCALAR[t])
+
+        if f.read(4) != b"GGUF":
+            raise UserError("not a GGUF file")
+        version = rd("<I")
+        if version < 2:
+            raise UserError(f"GGUF v{version} is not supported")
+        n_tensors, n_kv = rd("<Q"), rd("<Q")
+        meta = {}
+        for _ in range(n_kv):
+            key = rstr()
+            meta[key] = rval(rd("<I"))
+    return meta, n_tensors
+
+
+def _read_specs(path):
+    meta, n_tensors = gguf_metadata(path)
+    arch = meta.get("general.architecture", "")
+    a = lambda k: meta.get(f"{arch}.{k}")
+    files = [path]
+    sm = _SPLIT_RE.search(path)
+    if sm:
+        files = [_SPLIT_RE.sub(f"-{i:05d}-of-{sm.group(2)}.gguf", path) for i in range(1, int(sm.group(2)) + 1)]
+    layers = a("block_count") or 0
+    heads = a("attention.head_count")
+    kv = a("attention.head_count_kv")
+    attn_layers = layers
+    if isinstance(kv, list):  # per-layer; 0 = no attention in that layer (hybrid models)
+        attn_layers = sum(1 for x in kv if x) or layers
+        kv = max(kv) if kv else None
+    if isinstance(heads, list):
+        heads = max(heads) if heads else None
+    if a("full_attention_interval"):
+        attn_layers = layers // a("full_attention_interval")
+    embd = a("embedding_length")
+    head_dim = (embd // heads) if embd and heads else None
+    return {
+        "name": meta.get("general.name"),
+        "architecture": arch,
+        "size_label": meta.get("general.size_label"),
+        "quant": GGUF_FTYPES.get(meta.get("general.file_type"), meta.get("general.file_type")),
+        "file_bytes": sum(os.path.getsize(p) for p in files if os.path.isfile(p)),
+        "files": len(files),
+        "files_missing": sum(1 for p in files if not os.path.isfile(p)),
+        "tensors": n_tensors,
+        "trained_ctx": a("context_length"),
+        "layers": layers,
+        "attention_layers": attn_layers,
+        "embedding_length": embd,
+        "heads": heads,
+        "kv_heads": kv,
+        "key_length": a("attention.key_length") or head_dim,
+        "value_length": a("attention.value_length") or head_dim,
+        "experts": a("expert_count"),
+        "experts_used": a("expert_used_count"),
+        "pooling_type": a("pooling_type"),
+        "chat_template": bool(meta.get("tokenizer.chat_template")),
+        # "toggle" = template has an enable_thinking switch, "always" = thinks but can't be switched off
+        "thinking_support": ("toggle" if "enable_thinking" in (meta.get("tokenizer.chat_template") or "")
+                             else "always" if "<think>" in (meta.get("tokenizer.chat_template") or "")
+                             else "none"),
+    }
+
+
+def model_specs(m):
+    path = model_path(m.get("model"))
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {"error": f"model file not found: {path}"}
+    key = (path, st.st_mtime, st.st_size)
+    if key not in _spec_cache:
+        try:
+            _spec_cache[key] = _read_specs(path)
+        except Exception as e:
+            _spec_cache[key] = {"error": f"cannot read GGUF metadata: {e}"}
+    s = dict(_spec_cache[key])
+    if "error" in s:
+        return s
+    # Estimates for the configured context (unified KV cache: independent of --parallel).
+    ctx = m.get("ctx_size") or 0
+    kvb = None
+    if s["kv_heads"] and s["key_length"]:
+        kvb = int(s["attention_layers"] * ctx * s["kv_heads"] *
+                  (s["key_length"] * KV_BYTES.get(m.get("cache_type_k"), 2) +
+                   s["value_length"] * KV_BYTES.get(m.get("cache_type_v"), 2)))
+    s["kv_cache_bytes"] = kvb
+    s["est_memory_bytes"] = s["file_bytes"] + (kvb or 0)
+    warn = []
+    if s["trained_ctx"] and ctx > s["trained_ctx"]:
+        warn.append(f"ctx_size {ctx} exceeds the trained context {s['trained_ctx']}")
+    if s["files_missing"]:
+        warn.append(f"{s['files_missing']} of {s['files']} split files missing")
+    if m.get("jinja") and not s["chat_template"]:
+        warn.append("--jinja set but the GGUF has no chat template")
+    if m.get("thinking") and s["thinking_support"] != "toggle":
+        warn.append(f"thinking={m['thinking']} has no effect: " +
+                    ("this model always thinks" if s["thinking_support"] == "always"
+                     else "this model has no thinking mode"))
+    if m.get("thinking") and not m.get("jinja"):
+        warn.append("thinking needs jinja=true")
+    s["warnings"] = warn
+    return s
+
+
+def fmt_bytes(n):
+    return "?" if n is None else f"{n / 1e9:.1f} GB" if n >= 1e9 else f"{n / 1e6:.0f} MB"
+
+
+def fmt_ctx(n):
+    return "?" if not n else f"{n // 1024}k" if n % 1024 == 0 else str(n)
+
+
+# --------------------------------------------------------------------------- chat / embedding test
+
+def _server_url(m, path):
+    return f"http://{client_host(m)}:{m['port']}{path}"
+
+
+class UpstreamError(UserError):
+    def __init__(self, msg, code=502):
+        super().__init__(msg)
+        self.code = code
+
+
+def _post_json(m, path, body, timeout=600):
+    data = body if isinstance(body, bytes) else json.dumps(body).encode()
+    req = urllib.request.Request(_server_url(m, path), data=data, headers={"Content-Type": "application/json"})
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")
+        try:
+            detail = json.loads(detail)["error"]["message"]
+        except Exception:
+            pass
+        raise UpstreamError(f"server returned {e.code}: {detail}", e.code)
+    except urllib.error.URLError as e:
+        raise UpstreamError(f"cannot reach {_server_url(m, '')} ({e.reason}). Is the model running?")
+
+
+def pipe_response(handler, upstream):
+    """Stream an upstream HTTP response to a BaseHTTPRequestHandler client."""
+    with upstream:
+        handler.send_response(200)
+        handler.send_header("Content-Type", upstream.headers.get("Content-Type", "application/json"))
+        handler.send_header("Cache-Control", "no-store")
+        handler.end_headers()
+        try:
+            while chunk := upstream.read1(65536):
+                handler.wfile.write(chunk)
+                handler.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client went away; closing upstream makes llama-server stop generating
+
+
+def stream_chat(m, messages, params, on_content, on_reasoning):
+    """Stream a chat completion. Returns (content, timings or None)."""
+    body = {"model": m.get("alias") or "local", "messages": messages, "stream": True, **params}
+    content, timings = [], None
+    with _post_json(m, "/v1/chat/completions", body) as r:
+        for raw in r:
+            line = raw.decode(errors="replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            j = json.loads(data)
+            timings = j.get("timings") or timings
+            for ch in j.get("choices") or []:
+                d = ch.get("delta") or {}
+                if d.get("reasoning_content"):
+                    on_reasoning(d["reasoning_content"])
+                if d.get("content"):
+                    content.append(d["content"])
+                    on_content(d["content"])
+    return "".join(content), timings
+
+
+def embed(m, text):
+    with _post_json(m, "/v1/embeddings", {"model": m.get("alias") or "local", "input": text}) as r:
+        return json.loads(r.read())["data"][0]["embedding"]
+
+
+def cosine(a, b):
+    dot = sum(x * y for x, y in zip(a, b))
+    na, nb = sum(x * x for x in a) ** 0.5, sum(y * y for y in b) ** 0.5
+    return dot / (na * nb) if na and nb else 0.0
+
+
+def fmt_timings(t, wall):
+    if not t:
+        return f"{wall:.1f}s"
+    return (f"{t.get('predicted_n', '?')} tokens @ {t.get('predicted_per_second', 0):.1f} tok/s · "
+            f"prompt {t.get('prompt_n', '?')} tokens @ {t.get('prompt_per_second', 0):.0f} tok/s · {wall:.1f}s")
+
+
+# --------------------------------------------------------------------------- opencode
+
+def opencode_merged(cfg):
+    path = Path(expand(cfg["global"]["opencode_path"]))
+    existing = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text())
+        except json.JSONDecodeError as e:
+            raise UserError(f"{path} is not valid JSON: {e}")
+    out = copy.deepcopy(existing)
+    out.setdefault("$schema", "https://opencode.ai/config.json")
+    providers = out.setdefault("provider", {})
+    g = cfg["global"]
+    exported = [(mid, m) for mid, m in cfg["models"].items() if m.get("opencode_provider") and not m.get("embedding")]
+    if g.get("opencode_mode", "gateway") == "gateway":
+        pid = g.get("opencode_provider_id") or "llama-local"
+        renamed = {}
+        for mid, m in exported:
+            key, old_pid = m.get("alias") or mid, m["opencode_provider"]
+            # Move the model out of its old per-model provider (drop that provider once empty).
+            if old_pid != pid and isinstance(providers.get(old_pid), dict):
+                providers[old_pid].get("models", {}).pop(key, None)
+                if not providers[old_pid].get("models"):
+                    del providers[old_pid]
+                renamed[f"{old_pid}/{key}"] = f"{pid}/{key}"
+        prov = providers.setdefault(pid, {})
+        prov.setdefault("npm", "@ai-sdk/openai-compatible")
+        prov.setdefault("name", "llama.cpp (local)")
+        opts = prov.setdefault("options", {})
+        opts["baseURL"] = gateway_url(g)
+        opts.setdefault("timeout", 600000)
+        pmodels = prov.setdefault("models", {})
+        for mid, m in exported:
+            entry = pmodels.setdefault(m.get("alias") or mid, {"name": m["name"]})
+            entry["limit"] = {"context": m["ctx_size"], "output": m.get("opencode_output") or 8192}
+        # Keep the default model and agents pointing at the moved models.
+        for k in ("model", "small_model"):
+            if out.get(k) in renamed:
+                out[k] = renamed[out[k]]
+        for agent in (out.get("agent") or {}).values():
+            if isinstance(agent, dict) and agent.get("model") in renamed:
+                agent["model"] = renamed[agent["model"]]
+        return path, existing, out
+    for mid, m in exported:
+        pid = m["opencode_provider"]
+        prov = providers.setdefault(pid, {})
+        prov.setdefault("npm", "@ai-sdk/openai-compatible")
+        prov.setdefault("name", f"llama.cpp — {m['name']}")
+        opts = prov.setdefault("options", {})
+        opts["baseURL"] = f"http://{client_host(m)}:{m['port']}/v1"
+        opts.setdefault("timeout", 600000)
+        entry = prov.setdefault("models", {}).setdefault(m.get("alias") or mid, {"name": m["name"]})
+        entry["limit"] = {"context": m["ctx_size"], "output": m.get("opencode_output") or 8192}
+    return path, existing, out
+
+
+def opencode_write(cfg):
+    path, existing, out = opencode_merged(cfg)
+    backup = None
+    if path.exists():
+        backup = path.with_name(f"{path.name}.backup-{time.strftime('%Y%m%d-%H%M%S')}")
+        shutil.copy2(path, backup)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(out, indent=2, ensure_ascii=False) + "\n")
+    return path, backup
+
+
+# --------------------------------------------------------------------------- gateway
+
+GATEWAY_ID = "_gateway"  # model ids can't start with "_", so no clash with run/log files
+
+
+def gateway_url(g):
+    h = g.get("gateway_host") or "127.0.0.1"
+    return f"http://{'127.0.0.1' if h in ('0.0.0.0', '::') else h}:{g['gateway_port']}/v1"
+
+
+def gateway_status(cfg):
+    st = {"state": "stopped", "url": gateway_url(cfg["global"])}
+    run = read_run(GATEWAY_ID)
+    if run and pid_alive(run):
+        st.update(state="running", pid=run["pid"], started=run.get("started"))
+    return st
+
+
+def gateway_start(cfg):
+    g = cfg["global"]
+    if gateway_status(cfg)["state"] == "running":
+        return
+    host = g.get("gateway_host") or "127.0.0.1"
+    if port_in_use("127.0.0.1" if host in ("0.0.0.0", "::") else host, g["gateway_port"]):
+        raise UserError(f"gateway: something is already listening on port {g['gateway_port']}")
+    cmd = [sys.executable, str(Path(__file__).resolve()), "gateway", "run"]
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    lp = log_file(GATEWAY_ID)
+    _rotate_log(lp)
+    with open(lp, "ab") as logf:
+        proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                start_new_session=True, close_fds=True)
+    threading.Thread(target=proc.wait, daemon=True).start()
+    run_file(GATEWAY_ID).write_text(json.dumps({"pid": proc.pid, "cmd": cmd, "started": time.time()}))
+    time.sleep(0.4)
+    if proc.poll() is not None:
+        run_file(GATEWAY_ID).unlink(missing_ok=True)
+        raise UserError(f"gateway exited immediately:\n{tail(lp, 10)}")
+
+
+def gateway_stop():
+    return stop_model(GATEWAY_ID, timeout=5)
+
+
+def find_model(cfg, name):
+    """Match a request's model name against alias or id; tolerates a "provider/" prefix."""
+    for mid, m in cfg["models"].items():
+        if name in (mid, m.get("alias")):
+            return mid, m
+    if name and "/" in name:
+        return find_model(cfg, name.split("/", 1)[1])
+    return None, None
+
+
+class GatewayHandler(BaseHTTPRequestHandler):
+    server_version = "llmctl-gateway"
+
+    def log_message(self, fmt, *args):
+        sys.stdout.write(f"{time.strftime('%H:%M:%S')} {fmt % args}\n")
+        sys.stdout.flush()
+
+    def _error(self, code, msg):
+        data = json.dumps({"error": {"message": msg, "type": "llmctl_gateway", "code": code}}).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, obj):
+        data = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        path = urlparse(self.path).path.rstrip("/")
+        cfg = load_config()
+        if path in ("/health", "/v1/health"):
+            return self._json({"status": "ok"})
+        if path == "/v1/models":
+            data = []
+            for mid, m in cfg["models"].items():
+                st = model_status(mid, m, cfg["global"])["state"]
+                data.append({"id": m.get("alias") or mid, "object": "model", "owned_by": "llmctl",
+                             "llmctl_id": mid, "state": st, "port": m["port"]})
+            return self._json({"object": "list", "data": data})
+        self._error(404, f"not found: {path}")
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if not path.startswith("/v1/"):
+            return self._error(404, f"not found: {path}")
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        try:
+            name = json.loads(raw or b"{}").get("model")
+        except (json.JSONDecodeError, AttributeError):
+            return self._error(400, "request body must be JSON")
+        cfg = load_config()
+        mid, m = find_model(cfg, name)
+        if not m:
+            known = ", ".join(x.get("alias") or i for i, x in cfg["models"].items())
+            return self._error(404, f"unknown model {name!r}; available: {known}")
+        state = model_status(mid, m, cfg["global"])["state"]
+        if state in ("stopped", "exited"):
+            return self._error(503, f"model {mid} is not running. Start it with `llmctl start {mid}` or in the llmctl UI.")
+        try:
+            upstream = _post_json(m, path, raw)
+        except UpstreamError as e:
+            return self._error(e.code, f"{mid}: {e}")
+        pipe_response(self, upstream)
+
+
+def run_gateway(cfg):
+    g = cfg["global"]
+    host = g.get("gateway_host") or "127.0.0.1"
+    try:
+        srv = ThreadingHTTPServer((host, g["gateway_port"]), GatewayHandler)
+    except OSError as e:
+        raise UserError(f"gateway: cannot listen on {host}:{g['gateway_port']}: {e}")
+    print(f"llmctl gateway on {gateway_url(g)}", flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
+
+
+# --------------------------------------------------------------------------- web UI
+
+def state_payload(cfg):
+    g = cfg["global"]
+    try:
+        binary, binary_error = resolve_binary(g), None
+    except UserError as e:
+        binary, binary_error = None, str(e)
+    models = []
+    for mid, m in cfg["models"].items():
+        models.append({
+            "id": mid,
+            "config": m,
+            "status": model_status(mid, m, g),
+            "command": shlex.join(build_cmd(m, g, resolve=False)),
+            "specs": model_specs(m),
+            "is_default": mid in DEFAULT_MODELS,
+        })
+    return {"global": g, "binary": binary, "binary_error": binary_error, "fields": FIELDS,
+            "gateway": gateway_status(cfg),
+            "models": models, "config_path": str(CONFIG_PATH), "cpu_count": os.cpu_count()}
+
+
+class UIHandler(BaseHTTPRequestHandler):
+    server_version = "llmctl"
+    allow_any_host = False
+
+    def log_message(self, *args):
+        pass
+
+    def _send(self, code, obj=None, body=None, ctype="application/json"):
+        data = body if body is not None else json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _guard(self, mutating):
+        # Block DNS rebinding (Host check) and cross-site form posts (custom header forces
+        # a CORS preflight, which this server never approves).
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+        if not self.allow_any_host and host not in ("127.0.0.1", "localhost", "::1"):
+            self._send(403, {"error": "forbidden host"})
+            return False
+        if mutating and self.headers.get("X-Requested-With") != "llmctl":
+            self._send(403, {"error": "missing X-Requested-With header"})
+            return False
+        return True
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        return json.loads(self.rfile.read(n) or b"{}") if n else {}
+
+    def _handle(self, method):
+        if not self._guard(method != "GET"):
+            return
+        url = urlparse(self.path)
+        parts = [p for p in url.path.split("/") if p]
+        # /api/models/<id>/proxy/v1/... -> the model's server. Streams, so it must not hold the config lock.
+        if method == "POST" and len(parts) >= 6 and parts[:2] == ["api", "models"] and parts[3:5] == ["proxy", "v1"]:
+            return self._proxy(parts[2], "/" + "/".join(parts[4:]))
+        try:
+            with _config_lock:
+                result = self._route(method, parts, parse_qs(url.query))
+            if result is not None:
+                self._send(200, result)
+        except UserError as e:
+            self._send(400, {"error": str(e)})
+        except Exception as e:  # keep the UI alive and show the error
+            self._send(500, {"error": f"{type(e).__name__}: {e}"})
+
+    def _route(self, method, parts, query):
+        if method == "GET" and not parts:
+            self._send(200, body=UI_HTML.read_bytes(), ctype="text/html; charset=utf-8")
+            return None
+        if parts[:1] != ["api"]:
+            self._send(404, {"error": "not found"})
+            return None
+        cfg = load_config()
+        p = parts[1:]
+        if method == "GET" and p == ["state"]:
+            return state_payload(cfg)
+        if p == ["global"] and method == "POST":
+            body = self._body()
+            for k in DEFAULT_GLOBAL:
+                if k in body:
+                    set_global(cfg, k, body[k])
+            save_config(cfg)
+            return state_payload(cfg)
+        if p in (["gateway", "start"], ["gateway", "stop"]) and method == "POST":
+            gateway_stop()
+            if p[1] == "start":
+                gateway_start(cfg)
+            return state_payload(cfg)
+        if p == ["opencode"]:
+            if method == "GET":
+                path, existing, out = opencode_merged(cfg)
+                return {"path": str(path), "exists": path.exists(), "current": existing, "proposed": out}
+            if method == "POST":
+                path, backup = opencode_write(cfg)
+                return {"path": str(path), "backup": str(backup) if backup else None}
+        if p == ["models"] and method == "POST":
+            body = self._body()
+            mid = (body.get("id") or "").strip()
+            if mid in cfg["models"]:
+                raise UserError(f"model {mid!r} already exists")
+            src = body.get("from")
+            m = copy.deepcopy(cfg["models"][src]) if src in cfg["models"] else _model(host="127.0.0.1", ngl=999,
+                                                                                     ctx_size=8192, jinja=True)
+            m.update(name=mid, alias=mid, autostart=False, opencode_provider=None, port=next_free_port(cfg))
+            m["model"] = m.get("model") or "$HOME/Models/LLM/"
+            if not ID_RE.match(mid):
+                raise UserError(f"invalid model id {mid!r} (letters, digits, . _ -)")
+            cfg["models"][mid] = m
+            save_config(cfg)
+            return state_payload(cfg)
+        if p == ["start-autostart"] and method == "POST":
+            errors = []
+            for mid, m in cfg["models"].items():
+                if m.get("autostart") and model_status(mid, m, cfg["global"])["state"] in ("stopped", "exited"):
+                    try:
+                        start_model(cfg, mid)
+                    except UserError as e:
+                        errors.append(str(e))
+            if errors:
+                raise UserError("\n".join(errors))
+            return state_payload(cfg)
+        if p == ["stop-all"] and method == "POST":
+            for mid in cfg["models"]:
+                stop_model(mid)
+            return state_payload(cfg)
+        if len(p) >= 2 and p[0] == "models":
+            mid = p[1]
+            action = p[2] if len(p) > 2 else None
+            if action == "logs" and method == "GET":
+                n = int(query.get("n", ["300"])[0])
+                return {"log": tail(log_file(mid), n), "path": str(log_file(mid))}
+            if method == "DELETE" and action is None:
+                get_model(cfg, mid)
+                stop_model(mid)
+                del cfg["models"][mid]
+                save_config(cfg)
+                return state_payload(cfg)
+            if method == "POST" and action is None:
+                get_model(cfg, mid)
+                m = validate_model(mid, normalize_model(self._body()))
+                cfg["models"][mid] = m
+                save_config(cfg)
+                return state_payload(cfg)
+            if method == "POST" and action == "reset":
+                if mid not in DEFAULT_MODELS:
+                    raise UserError(f"{mid} has no built-in defaults")
+                cfg["models"][mid] = copy.deepcopy(DEFAULT_MODELS[mid])
+                save_config(cfg)
+                return state_payload(cfg)
+            if method == "POST" and action in ("start", "stop", "restart"):
+                get_model(cfg, mid)
+                if action in ("stop", "restart"):
+                    stop_model(mid)
+                if action in ("start", "restart"):
+                    start_model(cfg, mid)
+                return state_payload(cfg)
+        self._send(404, {"error": "not found"})
+        return None
+
+    def _proxy(self, mid, path):
+        try:
+            m = get_model(load_config(), mid)
+            upstream = _post_json(m, path, self._body())
+        except UserError as e:
+            self._send(502, {"error": str(e)})
+            return
+        pipe_response(self, upstream)
+
+    def do_GET(self):
+        self._handle("GET")
+
+    def do_POST(self):
+        self._handle("POST")
+
+    def do_DELETE(self):
+        self._handle("DELETE")
+
+
+def run_ui(cfg, host, port, open_browser):
+    UIHandler.allow_any_host = host not in ("127.0.0.1", "localhost", "::1")
+    try:
+        srv = ThreadingHTTPServer((host, port), UIHandler)
+    except OSError as e:
+        raise UserError(f"cannot listen on {host}:{port}: {e}")
+    url = f"http://{'127.0.0.1' if host in ('0.0.0.0', '::') else host}:{port}/"
+    print(f"llmctl UI on {url}  (Ctrl-C to quit; running models keep running)")
+    if open_browser:
+        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print()
+    finally:
+        srv.server_close()
+
+
+# --------------------------------------------------------------------------- CLI
+
+STATE_LABEL = {"ready": "ready", "loading": "loading", "starting": "starting",
+               "stopped": "stopped", "exited": "exited!"}
+
+
+def fmt_age(ts):
+    if not ts:
+        return ""
+    s = int(time.time() - ts)
+    return f"{s // 3600}h{s % 3600 // 60:02d}m" if s >= 3600 else f"{s // 60}m{s % 60:02d}s"
+
+
+def resolve_ids(cfg, ids, all_flag, default_autostart=False):
+    if all_flag:
+        return list(cfg["models"])
+    if ids:
+        for mid in ids:
+            get_model(cfg, mid)
+        return ids
+    if default_autostart:
+        auto = [mid for mid, m in cfg["models"].items() if m.get("autostart")]
+        if not auto:
+            raise UserError("no model ids given and no model has autostart=true")
+        return auto
+    raise UserError("give one or more model ids, or --all")
+
+
+def cmd_status(cfg, args):
+    rows = [("ID", "STATE", "PORT", "CTX", "PID", "UP", "ENDPOINT", "NOTES")]
+    for mid, m in cfg["models"].items():
+        st = model_status(mid, m, cfg["global"])
+        notes = []
+        if not st["model_found"]:
+            notes.append("model file missing")
+        if st.get("stale"):
+            notes.append("config changed, restart to apply")
+        if m.get("autostart"):
+            notes.append("autostart")
+        rows.append((mid, STATE_LABEL[st["state"]], str(m["port"]), str(m["ctx_size"]),
+                     str(st.get("pid", "")), fmt_age(st.get("started")) if st.get("pid") else "",
+                     st["url"], ", ".join(notes)))
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    for r in rows:
+        print("  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip())
+    gw = gateway_status(cfg)
+    print(f"\ngateway {gw['state']}" + (f" (pid {gw['pid']})" if gw.get("pid") else "") +
+          f" -> {gw['url']}  (one endpoint for all models, routed by model name)")
+
+
+def cmd_start(cfg, args):
+    ids = resolve_ids(cfg, args.ids, args.all, default_autostart=True)
+    overrides = parse_pairs(args.set or [])
+    if args.ctx:
+        overrides.append(("ctx_size", args.ctx))
+    if args.port:
+        if len(ids) > 1:
+            raise UserError("--port only makes sense with a single model")
+        overrides.append(("port", args.port))
+    if args.save and overrides:
+        for mid in ids:
+            cfg["models"][mid] = validate_model(mid, apply_settings(cfg["models"][mid], overrides))
+        save_config(cfg)
+    failed = False
+    for mid in ids:
+        m = apply_settings(cfg["models"][mid], overrides)
+        try:
+            pid = start_model(cfg, mid, m)
+            print(f"started {mid} (pid {pid}) -> http://{client_host(m)}:{m['port']}/v1   ctx {m['ctx_size']}")
+        except UserError as e:
+            failed = True
+            print(f"error: {e}", file=sys.stderr)
+    if args.wait:
+        for mid in ids:
+            if read_run(mid):
+                try:
+                    wait_ready(cfg, mid)
+                    print(f"\r  {mid}: ready" + " " * 20)
+                except UserError as e:
+                    failed = True
+                    print(f"\nerror: {e}", file=sys.stderr)
+    elif not failed:
+        print("models load in the background; `llmctl status` or `llmctl logs <id> -f` to follow")
+    return 1 if failed else 0
+
+
+def cmd_stop(cfg, args):
+    ids = resolve_ids(cfg, args.ids, args.all)
+    for mid in ids:
+        print(f"stopped {mid}" if stop_model(mid) else f"{mid} was not running")
+
+
+def cmd_restart(cfg, args):
+    for mid in resolve_ids(cfg, args.ids, args.all):
+        stop_model(mid)
+    args.set, args.ctx, args.port, args.save = None, None, None, False
+    return cmd_start(cfg, args)
+
+
+def cmd_show(cfg, args):
+    mid = args.id
+    m = get_model(cfg, mid)
+    print(f"[{mid}]")
+    group = None
+    for f in FIELDS:
+        if f["group"] != group:
+            group = f["group"]
+            print(f"  # {group}")
+        v = m.get(f["key"])
+        shown = "" if v is None else json.dumps(v) if not isinstance(v, str) else v
+        extra = f"   -> {model_path(v)}" if f["type"] == "path" and v and model_path(v) != v else ""
+        print(f"  {f['key']:<18} {shown}{extra}")
+    print("\n  command:")
+    print("  " + shlex.join(build_cmd(m, cfg["global"], resolve=False)))
+
+
+def cmd_info(cfg, args):
+    ids = args.ids or list(cfg["models"])
+    specs = {mid: model_specs(get_model(cfg, mid)) for mid in ids}
+    if args.json:
+        print(json.dumps(specs, indent=2))
+        return
+    for mid in ids:
+        m, s = cfg["models"][mid], specs[mid]
+        if "error" in s:
+            print(f"{mid}\n  {s['error']}\n")
+            continue
+        tags = ", ".join(x for x in (s["architecture"], s["size_label"], s["quant"]) if x)
+        print(f"{mid}  {s['name'] or ''}  ({tags})")
+        files = f" in {s['files']} files" if s["files"] > 1 else ""
+        print(f"  file          {fmt_bytes(s['file_bytes'])}{files}, {s['tensors']} tensors")
+        print(f"  context       trained {fmt_ctx(s['trained_ctx'])}, configured {fmt_ctx(m['ctx_size'])}")
+        arch = f"  layers        {s['layers']}"
+        if s["attention_layers"] != s["layers"]:
+            arch += f" ({s['attention_layers']} attention)"
+        arch += f", embd {s['embedding_length']}, heads {s['heads']} / {s['kv_heads']} kv"
+        if s["experts"]:
+            arch += f", experts {s['experts']} ({s['experts_used']} active)"
+        print(arch)
+        kv_type = m.get("cache_type_k") or "f16"
+        print(f"  KV cache      ~{fmt_bytes(s['kv_cache_bytes'])} at ctx {fmt_ctx(m['ctx_size'])} ({kv_type})")
+        print(f"  est. memory   ~{fmt_bytes(s['est_memory_bytes'])} + compute buffers")
+        print(f"  chat template {'yes' if s['chat_template'] else 'no'}")
+        think = {"toggle": f"switchable (setting: {m.get('thinking') or 'model default'})",
+                 "always": "always on", "none": "no"}[s["thinking_support"]]
+        print(f"  thinking      {think}")
+        for w in s["warnings"]:
+            print(f"  warning: {w}")
+        print()
+
+
+def cmd_chat(cfg, args):
+    mid = args.id
+    m = get_model(cfg, mid)
+    st = model_status(mid, m, cfg["global"])
+    if st["state"] != "ready":
+        raise UserError(f"{mid} is {st['state']}" + ("" if st["state"] == "loading" else f"; start it with `llmctl start {mid}`"))
+    tty = sys.stdout.isatty()
+    dim, bold, reset = ("\033[2m", "\033[1m", "\033[0m") if tty else ("", "", "")
+
+    if m.get("embedding"):
+        prev = None
+
+        def run(text):
+            nonlocal prev
+            t0 = time.time()
+            v = embed(m, text)
+            norm = sum(x * x for x in v) ** 0.5
+            head = ", ".join(f"{x:.4f}" for x in v[:6])
+            print(f"dim {len(v)} · norm {norm:.4f} · [{head}, ...] · {time.time() - t0:.2f}s")
+            if prev is not None:
+                print(f"cosine similarity to previous input: {cosine(prev, v):.4f}")
+            prev = v
+
+        if args.prompt:
+            run(" ".join(args.prompt))
+            return
+        print(f"{bold}{mid}{reset} embedding test: each line is embedded and compared to the previous one. Ctrl-D to quit.")
+        while True:
+            try:
+                text = input("text> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            if text:
+                run(text)
+
+    params = {"max_tokens": args.max_tokens}
+    think = args.think
+
+    def set_think(v):
+        nonlocal think
+        think = v
+        if v:
+            params["chat_template_kwargs"] = {"enable_thinking": v == "on"}
+        else:
+            params.pop("chat_template_kwargs", None)
+
+    set_think(think)
+    if args.temp is not None:
+        params["temperature"] = args.temp
+    system = args.system
+    history = []
+
+    def ask(text):
+        msgs = ([{"role": "system", "content": system}] if system else []) + history + [{"role": "user", "content": text}]
+        state = {"thinking": False}
+
+        def on_reasoning(s):
+            if args.no_think:
+                return
+            if not state["thinking"]:
+                sys.stdout.write(dim + "thinking: ")
+                state["thinking"] = True
+            sys.stdout.write(s)
+            sys.stdout.flush()
+
+        def on_content(s):
+            if state["thinking"]:
+                sys.stdout.write(reset + "\n\n")
+                state["thinking"] = False
+            sys.stdout.write(s)
+            sys.stdout.flush()
+
+        t0 = time.time()
+        try:
+            content, timings = stream_chat(m, msgs, params, on_content, on_reasoning)
+        except KeyboardInterrupt:
+            print(f"{reset}\n{dim}[stopped]{reset}")
+            return
+        print(f"{reset}\n{dim}{fmt_timings(timings, time.time() - t0)}{reset}")
+        history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": content}])
+
+    if args.prompt:
+        ask(" ".join(args.prompt))
+        return
+    print(f"{bold}{mid}{reset} chat ({st['url']}). Commands: /clear, /system <text>, /think on|off|default, /exit. Ctrl-C stops a reply.")
+    while True:
+        try:
+            text = input(f"{bold}you>{reset} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not text:
+            continue
+        if text in ("/exit", "/quit"):
+            return
+        if text == "/clear":
+            history.clear()
+            print("history cleared")
+            continue
+        if text.startswith("/think"):
+            v = text[len("/think"):].strip()
+            if v not in ("on", "off", "default"):
+                print("usage: /think on|off|default")
+                continue
+            set_think(None if v == "default" else v)
+            print(f"thinking: {v}")
+            continue
+        if text.startswith("/system"):
+            system = text[len("/system"):].strip() or None
+            print(f"system prompt: {system or '(none)'}")
+            continue
+        ask(text)
+
+
+def cmd_cmd(cfg, args):
+    print(shlex.join(build_cmd(get_model(cfg, args.id), cfg["global"], resolve=False)))
+
+
+def cmd_set(cfg, args):
+    m = get_model(cfg, args.id)
+    m = validate_model(args.id, apply_settings(m, parse_pairs(args.pairs)))
+    cfg["models"][args.id] = m
+    save_config(cfg)
+    st = model_status(args.id, m, cfg["global"])
+    print(f"saved {args.id}" + (" (running: `llmctl restart " + args.id + "` to apply)" if st.get("stale") else ""))
+
+
+def cmd_add(cfg, args):
+    if args.id in cfg["models"]:
+        raise UserError(f"model {args.id!r} already exists")
+    if args.from_:
+        base = copy.deepcopy(get_model(cfg, args.from_))
+        base.update(autostart=False, opencode_provider=None)
+    else:
+        base = _model(host="127.0.0.1", ngl=999, ctx_size=8192, jinja=True)
+    base.update(name=args.id, alias=args.id, port=next_free_port(cfg))
+    m = validate_model(args.id, apply_settings(base, parse_pairs(args.pairs)))
+    cfg["models"][args.id] = m
+    save_config(cfg)
+    print(f"added {args.id}")
+
+
+def cmd_remove(cfg, args):
+    get_model(cfg, args.id)
+    stop_model(args.id)
+    del cfg["models"][args.id]
+    save_config(cfg)
+    print(f"removed {args.id}")
+
+
+def cmd_reset(cfg, args):
+    ids = args.ids or list(DEFAULT_MODELS)
+    for mid in ids:
+        if mid not in DEFAULT_MODELS:
+            raise UserError(f"{mid} has no built-in defaults")
+        cfg["models"][mid] = copy.deepcopy(DEFAULT_MODELS[mid])
+    save_config(cfg)
+    print("reset " + ", ".join(ids))
+
+
+def cmd_logs(cfg, args):
+    path = log_file(args.id)
+    get_model(cfg, args.id)
+    if not path.exists():
+        print(f"no log yet ({path})")
+        return
+    print(tail(path, args.n))
+    if args.follow:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            try:
+                while True:
+                    line = f.readline()
+                    if line:
+                        sys.stdout.write(line.decode(errors="replace"))
+                        sys.stdout.flush()
+                    else:
+                        time.sleep(0.3)
+            except KeyboardInterrupt:
+                pass
+
+
+def cmd_run(cfg, args):
+    m = validate_model(args.id, apply_settings(get_model(cfg, args.id), parse_pairs(args.set or [])))
+    cmd = build_cmd(m, cfg["global"])
+    print("$ " + shlex.join(cmd), flush=True)
+    os.execv(cmd[0], cmd)
+
+
+def cmd_global(cfg, args):
+    if not args.pairs:
+        for k, v in cfg["global"].items():
+            print(f"{k:<21} {v}")
+        try:
+            print(f"{'(llama-server found)':<21} {resolve_binary(cfg['global'])}")
+        except UserError as e:
+            print(f"{'(llama-server found)':<21} ERROR: {e}")
+        return
+    for k, v in parse_pairs(args.pairs):
+        set_global(cfg, k, v)
+    save_config(cfg)
+    print("saved")
+
+
+def cmd_gateway(cfg, args):
+    if args.action == "run":
+        return run_gateway(cfg)
+    if args.action in ("stop", "restart"):
+        print("gateway stopped" if gateway_stop() else "gateway was not running")
+    if args.action in ("start", "restart"):
+        gateway_start(cfg)
+    gw = gateway_status(cfg)
+    print(f"gateway {gw['state']}" + (f" (pid {gw['pid']})" if gw.get("pid") else "") + f" -> {gw['url']}")
+
+
+def cmd_opencode(cfg, args):
+    if args.write:
+        path, backup = opencode_write(cfg)
+        print(f"wrote {path}" + (f" (backup: {backup})" if backup else ""))
+    else:
+        path, _, out = opencode_merged(cfg)
+        print(f"// merged config for {path} (run with --write to save; existing file is backed up)")
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+
+
+def cmd_ui(cfg, args):
+    g = cfg["global"]
+    run_ui(cfg, args.host or g["ui_host"], args.port or g["ui_port"], not args.no_open)
+
+
+def cmd_config(cfg, args):
+    print(CONFIG_PATH)
+    if args.edit:
+        editor = os.environ.get("EDITOR", "vi")
+        subprocess.call(shlex.split(editor) + [str(CONFIG_PATH)])
+
+
+def main(argv=None):
+    settings_help = "settings: " + ", ".join(FIELD_BY_KEY)
+    ap = argparse.ArgumentParser(
+        prog="llmctl",
+        description="Configure and run local llama-server models (CLI + web UI).",
+        epilog=f"Config: {CONFIG_PATH}. Override location with LLMCTL_HOME.\n{settings_help}",
+    )
+    ap.add_argument("--version", action="version", version=f"llmctl {__version__}")
+    sub = ap.add_subparsers(dest="command", metavar="<command>")
+
+    def add(name, fn, help, aliases=()):
+        p = sub.add_parser(name, help=help, aliases=list(aliases), description=help)
+        p.set_defaults(fn=fn)
+        return p
+
+    add("status", cmd_status, "show all models and whether they are running", ["ls", "list", "ps"])
+
+    p = add("start", cmd_start, "start models in the background (no ids = autostart models)", ["up"])
+    p.add_argument("ids", nargs="*")
+    p.add_argument("-a", "--all", action="store_true", help="start every configured model")
+    p.add_argument("-c", "--ctx", type=int, help="context size for this start")
+    p.add_argument("-p", "--port", type=int, help="port for this start")
+    p.add_argument("-s", "--set", action="append", metavar="KEY=VALUE", help="one-off setting (repeatable)")
+    p.add_argument("--save", action="store_true", help="also save --ctx/--port/--set to the config")
+    p.add_argument("-w", "--wait", action="store_true", help="wait until the models are loaded")
+
+    p = add("stop", cmd_stop, "stop models", ["down"])
+    p.add_argument("ids", nargs="*")
+    p.add_argument("-a", "--all", action="store_true")
+
+    p = add("restart", cmd_restart, "restart models (applies saved config changes)")
+    p.add_argument("ids", nargs="*")
+    p.add_argument("-a", "--all", action="store_true")
+    p.add_argument("-w", "--wait", action="store_true")
+
+    p = add("show", cmd_show, "show a model's settings and command line")
+    p.add_argument("id")
+    p = add("info", cmd_info, "model specs from the GGUF file + memory estimate", ["specs"])
+    p.add_argument("ids", nargs="*")
+    p.add_argument("--json", action="store_true")
+    p = add("chat", cmd_chat, "chat with a running model (embedding models: similarity test)")
+    p.add_argument("id")
+    p.add_argument("prompt", nargs="*", help="one-shot prompt; omit for an interactive chat")
+    p.add_argument("--system", help="system prompt")
+    p.add_argument("-t", "--temp", type=float, help="temperature (default: the server's)")
+    p.add_argument("-m", "--max-tokens", type=int, default=2048)
+    p.add_argument("--think", choices=["on", "off"], help="turn thinking on/off for these requests "
+                   "(hybrid models only; default: the server's setting)")
+    p.add_argument("--no-think", action="store_true", help="hide the model's reasoning output")
+    p = add("cmd", cmd_cmd, "print the llama-server command for a model")
+    p.add_argument("id")
+
+    p = add("set", cmd_set, "change saved settings, e.g. `llmctl set qwen3-coder ctx_size=131072`")
+    p.add_argument("id")
+    p.add_argument("pairs", nargs="+", metavar="KEY=VALUE", help=settings_help + " (empty value = unset)")
+
+    p = add("add", cmd_add, "add a model, e.g. `llmctl add mymodel model=~/m.gguf port=8106`")
+    p.add_argument("id")
+    p.add_argument("pairs", nargs="*", metavar="KEY=VALUE")
+    p.add_argument("--from", dest="from_", metavar="ID", help="copy settings from an existing model")
+
+    p = add("remove", cmd_remove, "remove a model from the config", ["rm"])
+    p.add_argument("id")
+    p = add("reset", cmd_reset, "restore built-in defaults (all built-in models if no ids)")
+    p.add_argument("ids", nargs="*")
+
+    p = add("logs", cmd_logs, "show a model's server log")
+    p.add_argument("id")
+    p.add_argument("-n", type=int, default=50, help="lines to show (default 50)")
+    p.add_argument("-f", "--follow", action="store_true")
+
+    p = add("run", cmd_run, "run a model in the foreground (Ctrl-C stops it)")
+    p.add_argument("id")
+    p.add_argument("-s", "--set", action="append", metavar="KEY=VALUE")
+
+    p = add("global", cmd_global, "show or change global settings (llama_server, gateway_*, opencode_*, ui_*)")
+    p.add_argument("pairs", nargs="*", metavar="KEY=VALUE")
+
+    p = add("gateway", cmd_gateway, "one endpoint (port 8100) for all models, routed by model name")
+    p.add_argument("action", nargs="?", default="status", choices=["status", "start", "stop", "restart", "run"])
+
+    p = add("opencode", cmd_opencode, "preview or write opencode.json providers from this config")
+    p.add_argument("--write", action="store_true", help="write it (existing file is backed up first)")
+
+    p = add("ui", cmd_ui, "open the web UI")
+    p.add_argument("--host")
+    p.add_argument("--port", type=int)
+    p.add_argument("--no-open", action="store_true", help="don't open a browser")
+
+    p = add("config", cmd_config, "print the config file path")
+    p.add_argument("--edit", action="store_true", help="open it in $EDITOR")
+
+    args = ap.parse_args(argv)
+    if not getattr(args, "fn", None):
+        args = ap.parse_args(["status"])
+    try:
+        cfg = load_config()
+        return args.fn(cfg, args) or 0
+    except UserError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
