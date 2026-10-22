@@ -5,6 +5,8 @@
 once (file, port, context size, GPU offload, sampling, thinking, ...) and then start, stop and
 test them from the terminal or the browser, several at the same time.
 
+![The llmctl web UI: one card per model with status, endpoint, specs and memory estimate, context size and port, and start/stop/logs/chat buttons](img/Screenshot.png)
+
 - **One config, two front ends.** The CLI and the web UI share the same settings and process
   state, so a model started in the browser can be stopped from the terminal.
 - **Several models at once**, each on its own port and running in the background. Closing the UI

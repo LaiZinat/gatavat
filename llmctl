@@ -678,8 +678,11 @@ def _read_specs(path):
         kv = max(kv) if kv else None
     if isinstance(heads, list):
         heads = max(heads) if heads else None
-    if a("full_attention_interval"):
-        attn_layers = layers // a("full_attention_interval")
+    # Hybrid models: only every n-th layer has full attention (and a KV cache). qwen3next GGUFs
+    # don't store the interval; llama.cpp hard-codes 4 for that architecture.
+    interval = a("full_attention_interval") or (4 if arch == "qwen3next" else None)
+    if interval:
+        attn_layers = layers // interval
     embd = a("embedding_length")
     head_dim = (embd // heads) if embd and heads else None
     return {
