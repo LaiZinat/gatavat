@@ -98,6 +98,10 @@ DEFAULT_GLOBAL = {
     # "per-model": one provider per model, each pointing at its own port.
     "opencode_mode": "gateway",
     "opencode_provider_id": "llama-local",
+    # `llmctl oc <profile>` runs opencode with OPENCODE_CONFIG=<profiles_dir>/<profile>.json
+    "opencode_bin": "opencode",
+    "opencode_profiles_dir": "~/.config/opencode/profiles",
+    "opencode_default_profile": "",
 }
 
 
@@ -1618,6 +1622,45 @@ def cmd_gateway(cfg, args):
     print(f"gateway {gw['state']}" + (f" (pid {gw['pid']})" if gw.get("pid") else "") + f" -> {gw['url']}")
 
 
+def opencode_profiles(g):
+    d = Path(expand(g.get("opencode_profiles_dir") or "~/.config/opencode/profiles"))
+    return d, sorted(p.stem for p in d.glob("*.json")) if d.is_dir() else []
+
+
+def cmd_oc(cfg, args):
+    g = cfg["global"]
+    pdir, names = opencode_profiles(g)
+    if args.list:
+        print(f"profiles in {pdir}:")
+        for n in names:
+            print(f"  {n}" + ("  (default)" if n == g.get("opencode_default_profile") else ""))
+        if not names:
+            print("  (none)")
+        return
+    profile = args.profile or g.get("opencode_default_profile") or None
+    env = dict(os.environ)
+    if profile and profile != "default":
+        path = Path(expand(profile)) if ("/" in profile or profile.endswith(".json")) else pdir / f"{profile}.json"
+        if not path.is_file():
+            raise UserError(f"opencode profile not found: {path}" +
+                            (f" (available: {', '.join(names)})" if names else ""))
+        env["OPENCODE_CONFIG"] = str(path)
+    for mid in args.start or []:
+        m = get_model(cfg, mid)
+        if model_status(mid, m, g)["state"] in ("stopped", "exited"):
+            start_model(cfg, mid)
+            print(f"started {mid}")
+        wait_ready(cfg, mid)
+        print(f"\r  {mid}: ready" + " " * 20)
+    binary = shutil.which(expand(g.get("opencode_bin") or "opencode"))
+    if not binary:
+        raise UserError("opencode not found on PATH; set it with `llmctl global opencode_bin=/path/to/opencode`")
+    extra = args.args
+    if "OPENCODE_CONFIG" in env:
+        print(f"OPENCODE_CONFIG={env['OPENCODE_CONFIG']}", flush=True)
+    os.execvpe(binary, [binary] + extra, env)
+
+
 def cmd_opencode(cfg, args):
     if args.write:
         path, backup = opencode_write(cfg)
@@ -1723,6 +1766,14 @@ def main(argv=None):
 
     p = add("opencode", cmd_opencode, "preview or write opencode.json providers from this config")
     p.add_argument("--write", action="store_true", help="write it (existing file is backed up first)")
+
+    p = add("oc", cmd_oc, "start opencode with a config profile, e.g. `llmctl oc laizinat`", ["code"])
+    p.add_argument("profile", nargs="?", help="name in the profiles dir, a path to a .json, or 'default' "
+                   "for opencode's normal config (default: opencode_default_profile)")
+    p.add_argument("-s", "--start", action="append", metavar="ID", help="start this model first and wait "
+                   "until it is ready (repeatable)")
+    p.add_argument("-l", "--list", action="store_true", help="list available profiles")
+    p.add_argument("args", nargs="*", help="after --: arguments passed to opencode")
 
     p = add("ui", cmd_ui, "open the web UI")
     p.add_argument("--host")

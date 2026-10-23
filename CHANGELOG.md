@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `llmctl oc [profile]` (alias `llmctl code`) starts opencode with
+  `OPENCODE_CONFIG=<profiles_dir>/<profile>.json`. Use `-s <id>` to start models first and wait
+  until they're ready, `--list` to list profiles, and `--` to pass arguments to opencode. New
+  global settings: `opencode_bin`, `opencode_profiles_dir`, `opencode_default_profile`.
+
+### Fixed
+
+- KV-cache estimate for Qwen3-Next (`qwen3next`) models was 4× too high: only every 4th layer
+  has full attention, but those GGUFs don't store the interval.
+- Endpoint links in the web UI were unreadable in dark mode.
+
 ## 0.1.0 (2026-10-22)
 
 First public release.

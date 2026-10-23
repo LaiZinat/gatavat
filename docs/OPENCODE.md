@@ -31,6 +31,22 @@ Options:
   file, e.g. one you load with `OPENCODE_CONFIG=...`.
 - `llmctl set <id> opencode_provider=`: leave a model out of opencode.
 
+## Start opencode with a profile
+
+```sh
+llmctl oc laizinat                     # = OPENCODE_CONFIG=~/.config/opencode/profiles/laizinat.json opencode
+llmctl oc laizinat -s qwen3-coder      # start the model first (if needed) and wait until it's ready
+llmctl oc laizinat -- ~/Projects/app   # everything after -- goes to opencode
+llmctl oc ~/somewhere/else.json        # a path works too
+llmctl oc                              # opencode_default_profile, or opencode's normal config if blank
+llmctl oc default                      # opencode's normal config, ignoring the default profile
+llmctl oc --list                       # available profiles
+```
+
+`llmctl code` is an alias. Profiles are `*.json` files in `opencode_profiles_dir`. opencode
+merges the profile with its global config, so providers written by `llmctl opencode --write` stay
+available. Set a default with `llmctl global opencode_default_profile=laizinat`.
+
 ## An agent setup for local models
 
 Local models do better with a narrower scope. This agent (add it under `"agent"` in

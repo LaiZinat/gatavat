@@ -95,6 +95,9 @@ llmctl global key=value ...
 | opencode_path | `~/.config/opencode/opencode.json` | file written by `llmctl opencode --write` |
 | opencode_mode | `gateway` | `gateway` = one provider for all models; `per-model` = one provider per model port |
 | opencode_provider_id | `llama-local` | provider id in gateway mode |
+| opencode_bin | `opencode` | opencode binary used by `llmctl oc` |
+| opencode_profiles_dir | `~/.config/opencode/profiles` | where `llmctl oc <name>` looks for `<name>.json` |
+| opencode_default_profile | (blank) | profile used by a bare `llmctl oc`; blank = opencode's normal config |
 
 ## Model specs and memory
 
