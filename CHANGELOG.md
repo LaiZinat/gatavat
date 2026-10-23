@@ -19,6 +19,13 @@
   its KV-cache memory and the change from the current setting, and flags sizes above the trained
   context. "Other…" accepts any value.
 
+- `llmctl ui stop | restart | status` and `llmctl ui -d` (background). `llmctl ui` opens the
+  running UI instead of failing with "Address already in use". `llmctl status` shows the UI.
+
+- Gateway fix for strict chat templates (Mistral/Devstral): system messages are merged into one
+  and consecutive same-role messages are joined, so opencode's requests no longer fail with
+  "conversation roles must alternate". Auto-detected from the GGUF; new setting `fix_roles`.
+
 ### Fixed
 
 - KV-cache estimate for Qwen3-Next (`qwen3next`) models was 4× too high: only every 4th layer

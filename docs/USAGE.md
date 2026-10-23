@@ -16,7 +16,9 @@
 
 ```sh
 llmctl                          # status of all models + gateway (same as: llmctl status / ls / ps)
-llmctl ui [--port N] [--no-open]  # web UI, default http://127.0.0.1:8090
+llmctl ui [--port N] [--no-open]  # web UI, default http://127.0.0.1:8090 (opens it if already running)
+llmctl ui -d                    # run the UI in the background, no terminal needed
+llmctl ui stop | restart | status
 llmctl start                    # start the models marked autostart
 llmctl start a b -w             # start several, wait until loaded
 llmctl start --all
@@ -60,6 +62,7 @@ llmctl reset [a ...]                    # restore built-in defaults
 | cache_type_k / cache_type_v | `--cache-type-k/v` | e.g. `q8_0` roughly halves KV memory (V needs flash attention) |
 | jinja | `--jinja` | use the model's chat template; needed for tool calling |
 | thinking | see below | `on` / `off` / blank = model default |
+| fix_roles | | gateway merges system messages and consecutive same-role messages for strict chat templates; blank = auto-detect (see below) |
 | embedding | `--embedding` | serve embeddings only |
 | pooling | `--pooling` | embedding pooling, e.g. `last` |
 | temp, top_p, top_k, min_p, repeat_penalty | `--temp` ... | server-side sampling defaults; clients can override |
@@ -75,6 +78,13 @@ llama-server loads the remaining parts itself.
 reasoning on the server. The setting only appears in the UI when the model's chat template has
 an `enable_thinking` switch. llmctl checks your llama-server's `--help` and uses whichever
 mechanism the build supports: `--reasoning-budget`, `--reasoning`, or `--chat-template-kwargs`.
+
+**Strict chat templates.** Some templates (Mistral, Devstral) reject a conversation unless it is
+exactly one system message followed by alternating user and assistant turns ("conversation roles
+must alternate"). Clients such as opencode sometimes send two system messages or two user
+messages in a row. For these models the gateway merges them before forwarding. It detects strict
+templates from the GGUF automatically; override with `fix_roles=on|off`. This only applies to
+requests through the gateway, not to direct requests to the model's own port.
 
 **Restart to apply.** When a running model's saved settings differ from the ones it was started
 with, status shows "config changed, restart to apply" and the UI shows a warning.
@@ -160,7 +170,8 @@ and all other settings under "All settings & command". The header shows the gate
 **Start autostart models**, **Stop all**, the **opencode.json** preview and write, **Add model**,
 and global **Settings**.
 
-Closing the UI (Ctrl-C) does not stop models or the gateway.
+Stop the UI with Ctrl-C (foreground) or `llmctl ui stop` (from any terminal, also for `-d`). If it's
+already running, `llmctl ui` opens it in the browser. Stopping the UI does not stop models or the gateway.
 
 ## Built-in example models
 

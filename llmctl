@@ -71,6 +71,8 @@ FIELDS = [
     F("embedding", "bool", "--embedding", "Mode", "Serve embeddings only"),
     F("thinking", "choice", None, "Mode", "Thinking/reasoning for hybrid models such as Qwen3.6 "
       "(blank = model default). Only shown when the chat template supports switching it", ["on", "off"]),
+    F("fix_roles", "choice", None, "Mode", "Gateway merges multiple system messages and consecutive same-role "
+      "messages before forwarding, for strict chat templates (Mistral/Devstral). Blank = auto-detect", ["on", "off"]),
     F("pooling", "choice", "--pooling", "Mode", "Embedding pooling (embedding models only)",
       ["none", "mean", "cls", "last", "rank"]),
     F("temp", "float", "--temp", "Sampling defaults", "Default temperature (clients can override)"),
@@ -477,7 +479,8 @@ def pid_alive(run):
         return True
     # The gateway runs under Python, which macOS framework builds re-exec as ".../Python.app/.../Python",
     # so match its arguments instead of the interpreter name.
-    needle = "gateway run" if run["cmd"][-2:] == ["gateway", "run"] else os.path.basename(run["cmd"][0])
+    needle = run.get("match") or ("gateway run" if run["cmd"][-2:] == ["gateway", "run"]
+                                  else os.path.basename(run["cmd"][0]))
     return needle in out and "<defunct>" not in out
 
 
@@ -587,10 +590,11 @@ def stop_model(mid, timeout=15):
         for sig, wait in ((signal.SIGTERM, timeout), (signal.SIGKILL, 5)):
             try:
                 os.killpg(pid, sig)
-            except ProcessLookupError:
-                break
-            except PermissionError:
-                os.kill(pid, sig)
+            except (ProcessLookupError, PermissionError):
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    break
             deadline = time.time() + wait
             while time.time() < deadline and pid_alive(run):
                 time.sleep(0.2)
@@ -735,6 +739,9 @@ def _read_specs(path):
         "thinking_support": ("toggle" if "enable_thinking" in (meta.get("tokenizer.chat_template") or "")
                              else "always" if "<think>" in (meta.get("tokenizer.chat_template") or "")
                              else "none"),
+        # Templates like Mistral's raise an error unless roles strictly alternate after one system message.
+        "strict_roles": "alternate" in (meta.get("tokenizer.chat_template") or "")
+                        and "raise_exception" in (meta.get("tokenizer.chat_template") or ""),
     }
 
 
@@ -999,6 +1006,44 @@ def gateway_stop():
     return stop_model(GATEWAY_ID, timeout=5)
 
 
+def _text(content):
+    if isinstance(content, list):
+        return "\n".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
+    return content or ""
+
+
+def _merge_content(a, b):
+    if isinstance(a, list) or isinstance(b, list):
+        as_parts = lambda c: c if isinstance(c, list) else ([{"type": "text", "text": c}] if c else [])
+        return as_parts(a) + as_parts(b)
+    return "\n\n".join(x for x in (a, b) if x)
+
+
+def normalize_roles(messages):
+    """Make a conversation acceptable to strict templates: one system message first, then no two
+    consecutive user (or plain assistant) messages. Tool calls and tool results are left alone."""
+    system, rest = [], []
+    for msg in messages:
+        role = msg.get("role")
+        if role in ("system", "developer"):
+            system.append(_text(msg.get("content")))
+            continue
+        prev = rest[-1] if rest else None
+        if (prev and role == prev.get("role") and role in ("user", "assistant")
+                and not prev.get("tool_calls") and not msg.get("tool_calls")):
+            rest[-1] = {**prev, "content": _merge_content(prev.get("content"), msg.get("content"))}
+        else:
+            rest.append(msg)
+    head = [{"role": "system", "content": "\n\n".join(x for x in system if x)}] if system else []
+    return head + rest
+
+
+def wants_role_fix(m):
+    if m.get("fix_roles"):
+        return m["fix_roles"] == "on"
+    return bool(model_specs(m).get("strict_roles"))
+
+
 def find_model(cfg, name):
     """Match a request's model name against alias or id; tolerates a "provider/" prefix."""
     for mid, m in cfg["models"].items():
@@ -1063,6 +1108,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
         state = model_status(mid, m, cfg["global"])["state"]
         if state in ("stopped", "exited"):
             return self._error(503, f"model {mid} is not running. Start it with `llmctl start {mid}` or in the llmctl UI.")
+        if path == "/v1/chat/completions" and wants_role_fix(m):
+            body = json.loads(raw)
+            msgs = body.get("messages") or []
+            fixed = normalize_roles(msgs)
+            if len(fixed) != len(msgs):
+                sys.stdout.write(f"{time.strftime('%H:%M:%S')} {mid}: merged {len(msgs)} messages into "
+                                 f"{len(fixed)} for its strict chat template\n")
+                body["messages"] = fixed
+                raw = json.dumps(body).encode()
         try:
             upstream = _post_json(m, path, raw)
         except UpstreamError as e:
@@ -1273,14 +1327,42 @@ class UIHandler(BaseHTTPRequestHandler):
         self._handle("DELETE")
 
 
+UI_ID = "_ui"
+
+
+def ui_url(host, port):
+    return f"http://{'127.0.0.1' if host in ('0.0.0.0', '::') else host}:{port}/"
+
+
+def ui_status():
+    run = read_run(UI_ID)
+    if run and pid_alive(run):
+        return {"state": "running", "pid": run["pid"], "url": run.get("url")}
+    return {"state": "stopped"}
+
+
 def run_ui(cfg, host, port, open_browser):
+    url = ui_url(host, port)
+    st = ui_status()
+    if st["state"] == "running":
+        print(f"llmctl UI is already running (pid {st['pid']}) on {st['url']}"
+              + ("; opening it" if open_browser else "") + ". Stop it with `llmctl ui stop`.")
+        if open_browser:
+            webbrowser.open(st["url"] or url)
+        return
     UIHandler.allow_any_host = host not in ("127.0.0.1", "localhost", "::1")
     try:
         srv = ThreadingHTTPServer((host, port), UIHandler)
     except OSError as e:
-        raise UserError(f"cannot listen on {host}:{port}: {e}")
-    url = f"http://{'127.0.0.1' if host in ('0.0.0.0', '::') else host}:{port}/"
-    print(f"llmctl UI on {url}  (Ctrl-C to quit; running models keep running)")
+        raise UserError(f"cannot listen on {host}:{port}: {e}\n"
+                        f"Find the process with `lsof -nP -iTCP:{port} -sTCP:LISTEN` and stop it with `kill <PID>`, "
+                        f"or use another port: `llmctl ui --port N`.")
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    run_file(UI_ID).write_text(json.dumps({"pid": os.getpid(), "cmd": sys.argv, "match": "llmctl ui",
+                                           "started": time.time(), "url": url}))
+    # `llmctl ui stop` sends SIGTERM; exit through `finally` so the run file is cleaned up.
+    signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+    print(f"llmctl UI on {url}  (Ctrl-C or `llmctl ui stop` to quit; running models keep running)", flush=True)
     if open_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:
@@ -1289,6 +1371,9 @@ def run_ui(cfg, host, port, open_browser):
         print()
     finally:
         srv.server_close()
+        run = read_run(UI_ID)
+        if run and run.get("pid") == os.getpid():
+            run_file(UI_ID).unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------- CLI
@@ -1339,6 +1424,8 @@ def cmd_status(cfg, args):
     gw = gateway_status(cfg)
     print(f"\ngateway {gw['state']}" + (f" (pid {gw['pid']})" if gw.get("pid") else "") +
           f" -> {gw['url']}  (one endpoint for all models, routed by model name)")
+    ui = ui_status()
+    print(f"ui      running (pid {ui['pid']}) -> {ui['url']}" if ui.get("pid") else "ui      not running (`llmctl ui`)")
     if opencode_stale(cfg):
         print(f"\nnote: {OPENCODE_HINT}")
 
@@ -1718,7 +1805,40 @@ def cmd_opencode(cfg, args):
 
 def cmd_ui(cfg, args):
     g = cfg["global"]
-    run_ui(cfg, args.host or g["ui_host"], args.port or g["ui_port"], not args.no_open)
+    host, port = args.host or g["ui_host"], args.port or g["ui_port"]
+    if args.action in ("stop", "restart"):
+        if stop_model(UI_ID, timeout=5):
+            print("UI stopped")
+        elif port_in_use("127.0.0.1" if host in ("0.0.0.0", "::") else host, port):
+            raise UserError(f"no llmctl UI is registered, but something listens on port {port} (perhaps a UI "
+                            f"from an older llmctl version). Find it with `lsof -nP -iTCP:{port} -sTCP:LISTEN` "
+                            f"and stop it with `kill <PID>`.")
+        else:
+            print("UI was not running")
+        if args.action == "stop":
+            return
+        time.sleep(0.3)
+    if args.action == "status":
+        st = ui_status()
+        print(f"UI running (pid {st['pid']}) on {st['url']}" if st.get("pid") else "UI not running")
+        return
+    if args.background:
+        if ui_status()["state"] == "running":
+            return run_ui(cfg, host, port, not args.no_open)  # prints "already running" and opens it
+        cmd = [sys.executable, str(Path(__file__).resolve()), "ui", "--host", host, "--port", str(port), "--no-open"]
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(log_file(UI_ID), "ab") as logf:
+            subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                             start_new_session=True, close_fds=True)
+        time.sleep(0.8)
+        st = ui_status()
+        if st["state"] != "running":
+            raise UserError(f"UI did not start:\n{tail(log_file(UI_ID), 10)}")
+        print(f"UI running in the background (pid {st['pid']}) on {st['url']}. Stop it with `llmctl ui stop`.")
+        if not args.no_open:
+            webbrowser.open(st["url"])
+        return
+    run_ui(cfg, host, port, not args.no_open)
 
 
 def cmd_config(cfg, args):
@@ -1820,7 +1940,9 @@ def main(argv=None):
     p.add_argument("-l", "--list", action="store_true", help="list available profiles")
     p.add_argument("args", nargs="*", help="after --: arguments passed to opencode")
 
-    p = add("ui", cmd_ui, "open the web UI")
+    p = add("ui", cmd_ui, "open the web UI (`llmctl ui stop|restart|status`, `-d` for background)")
+    p.add_argument("action", nargs="?", default="start", choices=["start", "stop", "restart", "status"])
+    p.add_argument("-d", "--background", action="store_true", help="run detached (no terminal needed)")
     p.add_argument("--host")
     p.add_argument("--port", type=int)
     p.add_argument("--no-open", action="store_true", help="don't open a browser")
