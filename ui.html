@@ -91,6 +91,11 @@ dialog::backdrop { background: rgba(0,0,0,.45); }
 .dlg-body { padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
 .log { height: 60vh; overflow: auto; background: var(--code); border-radius: 6px; padding: 10px; margin: 0;
   white-space: pre-wrap; word-break: break-all; }
+.banner { flex-basis: 100%; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 8px 12px; border-radius: 8px; font-size: 13px; border: 1px solid; }
+.banner.warn-b { border-color: var(--warn); background: color-mix(in srgb, var(--warn) 12%, transparent); }
+.banner.ok-b { border-color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }
+.banner .grow { flex: 1; min-width: 200px; }
 #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); max-width: calc(100vw - 32px);
   background: var(--text); color: var(--bg); padding: 10px 14px; border-radius: 8px; white-space: pre-wrap;
   display: none; z-index: 20; font-size: 13px; }
@@ -112,6 +117,7 @@ dialog::backdrop { background: rgba(0,0,0,.45); }
   <button id="btn-opencode">opencode.json…</button>
   <button id="btn-add">Add model</button>
   <button id="btn-global">Settings</button>
+  <div id="banner" class="banner" hidden></div>
 </header>
 <main>
   <div id="grid" class="grid"></div>
@@ -222,8 +228,27 @@ async function act(fn, okMsg) {
 }
 
 // ---------------------------------------------------------------- rendering
-function fieldInput(f, v) {
-  const id = `f-${f.key}`;
+// Context sizes are normally powers of two; each option shows its KV-cache memory and the change
+// from the saved value (needs kv_bytes_per_token from the GGUF specs).
+function ctxOption(m, n, selected) {
+  const s = m?.specs || {}, per = s.kv_bytes_per_token, cur = m?.config.ctx_size;
+  let label = n % 1024 === 0 ? `${kctx(n)} (${n})` : String(n);
+  if (per) {
+    const d = per * (n - cur);
+    label += ` · KV ${gb(per * n)}` + (n === cur ? ' (current)' : ` (${d > 0 ? '+' : '−'}${gb(Math.abs(d))})`);
+  }
+  if (s.trained_ctx && n > s.trained_ctx) label += ' · above trained context';
+  return `<option value="${n}" ${n === selected ? 'selected' : ''}>${esc(label)}</option>`;
+}
+
+function ctxSelect(m, v) {
+  const n = v ? Number(v) : null;
+  const vals = [...new Set([...CTX_PRESETS, ...(n ? [n] : [])])].sort((a, b) => a - b);
+  return `<select data-key="ctx_size" data-ctx>${vals.map(x => ctxOption(m, x, n)).join('')}<option value="__other">Other…</option></select>`;
+}
+
+function fieldInput(f, v, m) {
+  if (f.key === 'ctx_size') return `<label class="f" title="${esc(f.help)}">ctx_size${ctxSelect(m, v)}</label>`;
   if (f.type === 'bool')
     return `<label class="f check" title="${esc(f.help)}"><input type="checkbox" data-key="${f.key}" ${v ? 'checked' : ''}> ${f.key}</label>`;
   let input;
@@ -231,9 +256,8 @@ function fieldInput(f, v) {
     input = `<select data-key="${f.key}"><option value="">${f.key === 'thinking' ? 'model default' : 'default'}</option>${f.choices.map(c =>
       `<option ${c === v ? 'selected' : ''}>${c}</option>`).join('')}</select>`;
   } else {
-    const list = f.key === 'ctx_size' ? 'list="ctx-presets"' : '';
     const ph = f.key === 'threads' ? 'auto' : (f.type === 'int' || f.type === 'float') ? 'default' : '';
-    input = `<input type="text" data-key="${f.key}" value="${esc(v ?? '')}" placeholder="${ph}" ${list} spellcheck="false">`;
+    input = `<input type="text" data-key="${f.key}" value="${esc(v ?? '')}" placeholder="${ph}" spellcheck="false">`;
   }
   const wide = ['model', 'extra_args', 'name'].includes(f.key) ? 'wide' : '';
   return `<label class="f ${wide}" title="${esc(f.help)}">${f.key}${input}</label>`;
@@ -259,7 +283,7 @@ function cardHTML(m) {
       <span class="pill" data-pill><span class="dot"></span><span data-state></span></span>
     </div>
     <div class="sub" data-specs></div>
-    <div class="quick">${quickKeys.map(k => fieldInput(byKey[k], m.config[k])).join('')}</div>
+    <div class="quick">${quickKeys.map(k => fieldInput(byKey[k], m.config[k], m)).join('')}</div>
     <div class="row" data-notes></div>
     <div class="row">
       <button class="primary" data-act="start">Start</button>
@@ -310,7 +334,19 @@ function mountCard(m) {
   el.innerHTML = cardHTML(m);
   cards[m.id] = { el, dirty: false };
   el.addEventListener('input', () => updateDirty(m.id));
-  el.addEventListener('change', () => updateDirty(m.id));
+  el.addEventListener('change', e => {
+    const sel = e.target;
+    if (sel.matches('[data-ctx]') && sel.value === '__other') {
+      const cur = STATE.models.find(x => x.id === m.id);
+      const n = parseInt(prompt('Context size in tokens', cur.config.ctx_size), 10);
+      if (n > 0) {
+        if (![...sel.options].some(o => o.value === String(n)))
+          sel.querySelector('option[value="__other"]').insertAdjacentHTML('beforebegin', ctxOption(cur, n, n));
+        sel.value = String(n);
+      } else sel.value = String(cur.config.ctx_size);
+    }
+    updateDirty(m.id);
+  });
   el.addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.matches('input[type=text]')) save(m.id); });
   el.addEventListener('click', e => {
     const b = e.target.closest('[data-act]'); if (!b) return;
@@ -407,6 +443,7 @@ function apply(s) {
   const b = document.getElementById('binary');
   b.textContent = s.binary ? `llama-server: ${s.binary}` : s.binary_error;
   b.className = 'binary' + (s.binary ? '' : ' err');
+  renderBanner();
   const gw = s.gateway;
   $('gateway').className = `pill st-${gw.state === 'running' ? 'ready' : 'stopped'}`;
   $('gateway-label').textContent = gw.state === 'running' ? `gateway ${gw.url}` : 'gateway stopped';
@@ -427,6 +464,9 @@ function apply(s) {
 
 function syncForm(m) {
   const el = cards[m.id].el;
+  const missing = [...el.querySelectorAll('select[data-key]')].some(inp =>
+    ![...inp.options].some(o => o.value === String(m.config[inp.dataset.key] ?? '')));
+  if (missing) return remount(m.id);
   el.querySelectorAll('[data-key]').forEach(inp => {
     const v = m.config[inp.dataset.key];
     if (inp.type === 'checkbox') inp.checked = !!v; else inp.value = v ?? '';
@@ -612,21 +652,47 @@ document.getElementById('btn-opencode').onclick = async () => {
     document.getElementById('dlg-opencode').showModal();
   } catch (e) { toast(e.message, true); }
 };
-document.getElementById('opencode-write').onclick = async () => {
+async function writeOpencode() {
   try {
     const r = await post('/api/opencode');
     toast(`wrote ${r.path}` + (r.backup ? `\nbackup: ${r.backup}` : ''));
+    restartReminder = true;
     document.getElementById('dlg-opencode').close();
+    await refresh();
   } catch (e) { toast(e.message, true); }
-};
+}
+document.getElementById('opencode-write').onclick = writeOpencode;
+
+// Banner: opencode.json out of date -> offer to write it; after writing -> remind to restart opencode.
+let restartReminder = false, bannerKey = '';
+function renderBanner() {
+  const b = $('banner');
+  const key = STATE.opencode_stale ? 'stale' : restartReminder ? 'restart' : '';
+  if (key === bannerKey) return;  // don't rebuild on every poll (would swallow clicks)
+  bannerKey = key;
+  b.hidden = !key;
+  if (key === 'stale') {
+    b.className = 'banner warn-b';
+    b.innerHTML = `<span class="grow">opencode.json no longer matches your models (for example a changed context
+      size). Write it so opencode uses the new limits.</span>
+      <button class="primary" data-banner="write">Write opencode.json</button><button data-banner="preview">Preview…</button>`;
+  } else if (key === 'restart') {
+    b.className = 'banner ok-b';
+    b.innerHTML = `<span class="grow">opencode.json updated. <b>Restart opencode</b> to load it; it reads its config
+      only at startup.</span><button data-banner="dismiss">Got it</button>`;
+  }
+}
+$('banner').addEventListener('click', e => {
+  const a = e.target.closest('[data-banner]')?.dataset.banner;
+  if (a === 'write') writeOpencode();
+  else if (a === 'preview') $('btn-opencode').click();
+  else if (a === 'dismiss') { restartReminder = false; renderBanner(); }
+});
 
 $('btn-gateway').onclick = () => act(() => post(`/api/gateway/${STATE.gateway.state === 'running' ? 'stop' : 'start'}`));
 document.getElementById('btn-autostart').onclick = () => act(() => post('/api/start-autostart'), 'starting autostart models…');
 document.getElementById('btn-stopall').onclick = () => { if (confirm('Stop all running models?')) act(() => post('/api/stop-all'), 'stopped all'); };
 
-const dl = document.createElement('datalist'); dl.id = 'ctx-presets';
-dl.innerHTML = CTX_PRESETS.map(v => `<option value="${v}">${v / 1024}k</option>`).join('');
-document.body.appendChild(dl);
 
 refresh();
 setInterval(refresh, 2000);

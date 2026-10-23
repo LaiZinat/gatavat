@@ -82,7 +82,7 @@ your own:
 # 1. download a GGUF (example; any GGUF works)
 hf download Qwen/Qwen2.5-7B-Instruct-GGUF --include "*q4_k_m*" --local-dir ~/Models/LLM/Qwen2.5-7B-Instruct
 
-# 2. add it (next free port from 8106), check the specs, start it, wait until loaded
+# 2. add it (next free port from 8108), check the specs, start it, wait until loaded
 llmctl add qwen7b model=~/Models/LLM/Qwen2.5-7B-Instruct/qwen2.5-7b-instruct-q4_k_m.gguf ctx_size=32768
 llmctl info qwen7b
 llmctl start qwen7b -w

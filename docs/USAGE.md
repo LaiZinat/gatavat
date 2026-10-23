@@ -174,8 +174,10 @@ override them in the config or with the listed environment variables.
 | qwen3-coder | Qwen3-Coder-Next Q4_K_M | 8103 | 65536 | `${CODER_MODEL:-~/Models/LLM/Qwen3-Coder-Next/Qwen3-Coder-Next-Q4_K_M/Qwen3-Coder-Next-Q4_K_M-00001-of-00004.gguf}` |
 | qwen36-35b | Qwen3.6-35B-A3B Q8_0 | 8104 | 32768 | `${OPENHANDS_MODEL:-~/Models/LLM/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q8_0.gguf}` |
 | qwen3-embedding | Qwen3-Embedding-8B f16 | 8105 | 8192 | `${EMBEDDING_MODEL:-~/Models/Embedding/Qwen3-Embedding-8B/Qwen3-Embedding-8B-f16.gguf}` |
+| devstral2-123b | Devstral 2 123B Instruct Q3_K_S (q8_0 KV cache, flash attention) | 8106 | 16384 | `~/Models/LLM/Devstral-2-123B-Q3_K_S/Q3_K_S/Devstral-2-123B-Instruct-2512-Q3_K_S.gguf` (split) |
+| devstral-small2-24b | Devstral Small 2 24B Instruct Q8_0 (q8_0 KV cache, flash attention) | 8107 | 65536 | `~/Models/LLM/Devstral-Small-2-24B/Devstral-Small-2-24B-Instruct-2512-Q8_0.gguf` |
 
-Ports follow 8100 + i; models you add get the next free port from 8106. The gateway is on 8100
+Ports follow 8100 + i; models you add get the next free port from 8108. The gateway is on 8100
 and the UI on 8090.
 
 ## Updating

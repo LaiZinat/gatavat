@@ -8,12 +8,25 @@
   `OPENCODE_CONFIG=<profiles_dir>/<profile>.json`. Use `-s <id>` to start models first and wait
   until they're ready, `--list` to list profiles, and `--` to pass arguments to opencode. New
   global settings: `opencode_bin`, `opencode_profiles_dir`, `opencode_default_profile`.
+- Example model `devstral2-123b` (Devstral 2 123B Instruct, Q3_K_S, port 8106, 16k context
+  with q8_0 KV cache) and `devstral-small2-24b` (Devstral Small 2 24B Instruct, Q8_0, port 8107,
+  64k context with q8_0 KV cache). Models you add now start at port 8108.
+- **opencode reminders:** the web UI shows a banner when `opencode.json` no longer matches your
+  models (e.g. after changing a context size), with a one-click write, followed by a reminder to
+  restart opencode. `llmctl set/add/reset`, `llmctl status` and `llmctl opencode --write` print
+  the same hints.
+- **Context size dropdown** in the web UI with the standard sizes (2k to 256k). Each option shows
+  its KV-cache memory and the change from the current setting, and flags sizes above the trained
+  context. "Other…" accepts any value.
 
 ### Fixed
 
 - KV-cache estimate for Qwen3-Next (`qwen3next`) models was 4× too high: only every 4th layer
   has full attention, but those GGUFs don't store the interval.
 - Endpoint links in the web UI were unreadable in dark mode.
+- The gateway was reported as stopped while running when Python is a macOS framework build
+  (e.g. Homebrew), so every model start tried to launch a second gateway ("something is already
+  listening on port 8100").
 
 ## 0.1.0 (2026-10-22)
 

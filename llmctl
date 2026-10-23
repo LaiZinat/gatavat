@@ -159,6 +159,24 @@ DEFAULT_MODELS = {
         alias="qwen3-embedding", host="127.0.0.1", port=8105, ctx_size=8192, ngl=999,
         embedding=True, pooling="last",
     ),
+    # hf download unsloth/Devstral-2-123B-Instruct-2512-GGUF --include "Q3_K_S/*.gguf" \
+    #   --local-dir ~/Models/LLM/Devstral-2-123B-Q3_K_S   (split GGUF; resolved to part 00001)
+    "devstral2-123b": _model(
+        name="Devstral 2 123B Instruct Q3_K_S",
+        model="$HOME/Models/LLM/Devstral-2-123B-Q3_K_S/Q3_K_S/Devstral-2-123B-Instruct-2512-Q3_K_S.gguf",
+        alias="devstral-2-123b", host="127.0.0.1", port=8106, ctx_size=16384, ngl=999,
+        threads="auto", jinja=True, flash_attn="on", cache_type_k="q8_0", cache_type_v="q8_0",
+        opencode_provider="llama-devstral", opencode_output=4096,
+    ),
+    # hf download ggml-org/Devstral-Small-2-24B-Instruct-2512-GGUF \
+    #   --include "Devstral-Small-2-24B-Instruct-2512-Q8_0.gguf" --local-dir ~/Models/LLM/Devstral-Small-2-24B
+    "devstral-small2-24b": _model(
+        name="Devstral Small 2 24B Instruct Q8_0",
+        model="$HOME/Models/LLM/Devstral-Small-2-24B/Devstral-Small-2-24B-Instruct-2512-Q8_0.gguf",
+        alias="devstral-small-2-24b", host="127.0.0.1", port=8107, ctx_size=65536, ngl=999,
+        threads="auto", jinja=True, flash_attn="on", cache_type_k="q8_0", cache_type_v="q8_0",
+        opencode_provider="llama-devstral", opencode_output=8192,
+    ),
 }
 
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -301,7 +319,7 @@ def save_config(cfg):
 
 def next_free_port(cfg):
     used = {m.get("port") for m in cfg["models"].values()}
-    return next(p for p in range(8106, 9000) if p not in used)
+    return next(p for p in range(8108, 9000) if p not in used)
 
 
 def get_model(cfg, mid):
@@ -457,7 +475,10 @@ def pid_alive(run):
                              capture_output=True, text=True, timeout=2).stdout
     except Exception:
         return True
-    return os.path.basename(run["cmd"][0]) in out and "<defunct>" not in out
+    # The gateway runs under Python, which macOS framework builds re-exec as ".../Python.app/.../Python",
+    # so match its arguments instead of the interpreter name.
+    needle = "gateway run" if run["cmd"][-2:] == ["gateway", "run"] else os.path.basename(run["cmd"][0])
+    return needle in out and "<defunct>" not in out
 
 
 def health(m, timeout=0.5):
@@ -734,11 +755,13 @@ def model_specs(m):
         return s
     # Estimates for the configured context (unified KV cache: independent of --parallel).
     ctx = m.get("ctx_size") or 0
-    kvb = None
+    per_token = kvb = None
     if s["kv_heads"] and s["key_length"]:
-        kvb = int(s["attention_layers"] * ctx * s["kv_heads"] *
-                  (s["key_length"] * KV_BYTES.get(m.get("cache_type_k"), 2) +
-                   s["value_length"] * KV_BYTES.get(m.get("cache_type_v"), 2)))
+        per_token = (s["attention_layers"] * s["kv_heads"] *
+                     (s["key_length"] * KV_BYTES.get(m.get("cache_type_k"), 2) +
+                      s["value_length"] * KV_BYTES.get(m.get("cache_type_v"), 2)))
+        kvb = int(per_token * ctx)
+    s["kv_bytes_per_token"] = per_token
     s["kv_cache_bytes"] = kvb
     s["est_memory_bytes"] = s["file_bytes"] + (kvb or 0)
     warn = []
@@ -908,6 +931,18 @@ def opencode_merged(cfg):
     return path, existing, out
 
 
+def opencode_stale(cfg):
+    """True when opencode.json exists but no longer matches what --write would produce."""
+    try:
+        path, existing, out = opencode_merged(cfg)
+    except UserError:
+        return None
+    return path.exists() and out != existing
+
+
+OPENCODE_HINT = "opencode.json is out of date: run `llmctl opencode --write`, then restart opencode"
+
+
 def opencode_write(cfg):
     path, existing, out = opencode_merged(cfg)
     backup = None
@@ -1071,6 +1106,7 @@ def state_payload(cfg):
         })
     return {"global": g, "binary": binary, "binary_error": binary_error, "fields": FIELDS,
             "gateway": gateway_status(cfg),
+            "opencode_stale": opencode_stale(cfg),
             "models": models, "config_path": str(CONFIG_PATH), "cpu_count": os.cpu_count()}
 
 
@@ -1303,6 +1339,8 @@ def cmd_status(cfg, args):
     gw = gateway_status(cfg)
     print(f"\ngateway {gw['state']}" + (f" (pid {gw['pid']})" if gw.get("pid") else "") +
           f" -> {gw['url']}  (one endpoint for all models, routed by model name)")
+    if opencode_stale(cfg):
+        print(f"\nnote: {OPENCODE_HINT}")
 
 
 def cmd_start(cfg, args):
@@ -1532,6 +1570,8 @@ def cmd_set(cfg, args):
     save_config(cfg)
     st = model_status(args.id, m, cfg["global"])
     print(f"saved {args.id}" + (" (running: `llmctl restart " + args.id + "` to apply)" if st.get("stale") else ""))
+    if opencode_stale(cfg):
+        print(f"note: {OPENCODE_HINT}")
 
 
 def cmd_add(cfg, args):
@@ -1547,6 +1587,8 @@ def cmd_add(cfg, args):
     cfg["models"][args.id] = m
     save_config(cfg)
     print(f"added {args.id}")
+    if opencode_stale(cfg):
+        print(f"note: {OPENCODE_HINT}")
 
 
 def cmd_remove(cfg, args):
@@ -1565,6 +1607,8 @@ def cmd_reset(cfg, args):
         cfg["models"][mid] = copy.deepcopy(DEFAULT_MODELS[mid])
     save_config(cfg)
     print("reset " + ", ".join(ids))
+    if opencode_stale(cfg):
+        print(f"note: {OPENCODE_HINT}")
 
 
 def cmd_logs(cfg, args):
@@ -1665,6 +1709,7 @@ def cmd_opencode(cfg, args):
     if args.write:
         path, backup = opencode_write(cfg)
         print(f"wrote {path}" + (f" (backup: {backup})" if backup else ""))
+        print("restart opencode to load the new settings (it reads its config only at startup)")
     else:
         path, _, out = opencode_merged(cfg)
         print(f"// merged config for {path} (run with --write to save; existing file is backed up)")
