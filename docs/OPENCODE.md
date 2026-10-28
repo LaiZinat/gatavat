@@ -1,14 +1,14 @@
-# Using llmctl with opencode
+# Using gatavat with opencode
 
 ## Export your models
 
 ```sh
-llmctl opencode            # preview the merged opencode.json
-llmctl opencode --write    # write it; the existing file is backed up first (opencode.json.backup-<time>)
+gatavat opencode            # preview the merged opencode.json
+gatavat opencode --write    # write it; the existing file is backed up first (opencode.json.backup-<time>)
 ```
 
 By default (`opencode_mode=gateway`) every chat model with an `opencode_provider` value goes into
-one provider, `llama-local` ("llama.cpp (local)"), whose base URL is the llmctl gateway
+one provider, `llama-local` ("llama.cpp (local)"), whose base URL is the gatavat gateway
 (`http://127.0.0.1:8100/v1`). For each model:
 
 - the key is the model's `alias`, e.g. `llama-local/qwen3-coder-next`
@@ -21,31 +21,31 @@ and the top-level `model` / `small_model` and agents' `model` references are rew
 Run `--write` again whenever you change `ctx_size`, `opencode_output`, ports or the set of
 models, then restart opencode. It reads its config only at startup.
 
-The models must be running for opencode to use them: `llmctl start <id>` also starts the gateway.
+The models must be running for opencode to use them: `gatavat start <id>` also starts the gateway.
 
 Options:
 
-- `llmctl global opencode_mode=per-model`: one provider per model, each pointing at the model's
+- `gatavat global opencode_mode=per-model`: one provider per model, each pointing at the model's
   own port (no gateway needed).
-- `llmctl global opencode_path=~/.config/opencode/profiles/x.json`: write into another config
+- `gatavat global opencode_path=~/.config/opencode/profiles/x.json`: write into another config
   file, e.g. one you load with `OPENCODE_CONFIG=...`.
-- `llmctl set <id> opencode_provider=`: leave a model out of opencode.
+- `gatavat set <id> opencode_provider=`: leave a model out of opencode.
 
 ## Start opencode with a profile
 
 ```sh
-llmctl oc laizinat                     # = OPENCODE_CONFIG=~/.config/opencode/profiles/laizinat.json opencode
-llmctl oc laizinat -s qwen3-coder      # start the model first (if needed) and wait until it's ready
-llmctl oc laizinat -- ~/Projects/app   # everything after -- goes to opencode
-llmctl oc ~/somewhere/else.json        # a path works too
-llmctl oc                              # opencode_default_profile, or opencode's normal config if blank
-llmctl oc default                      # opencode's normal config, ignoring the default profile
-llmctl oc --list                       # available profiles
+gatavat oc laizinat                     # = OPENCODE_CONFIG=~/.config/opencode/profiles/laizinat.json opencode
+gatavat oc laizinat -s qwen3-coder      # start the model first (if needed) and wait until it's ready
+gatavat oc laizinat -- ~/Projects/app   # everything after -- goes to opencode
+gatavat oc ~/somewhere/else.json        # a path works too
+gatavat oc                              # opencode_default_profile, or opencode's normal config if blank
+gatavat oc default                      # opencode's normal config, ignoring the default profile
+gatavat oc --list                       # available profiles
 ```
 
-`llmctl code` is an alias. Profiles are `*.json` files in `opencode_profiles_dir`. opencode
-merges the profile with its global config, so providers written by `llmctl opencode --write` stay
-available. Set a default with `llmctl global opencode_default_profile=laizinat`.
+`gatavat code` is an alias. Profiles are `*.json` files in `opencode_profiles_dir`. opencode
+merges the profile with its global config, so providers written by `gatavat opencode --write` stay
+available. Set a default with `gatavat global opencode_default_profile=laizinat`.
 
 ## An agent setup for local models
 
@@ -99,13 +99,13 @@ Notes:
 ## Context size
 
 opencode's system prompt and tool definitions take a sizeable part of the context, so 8k is too
-small and 32k is tight. Check what a larger context costs with `llmctl info <id>`: the KV-cache
+small and 32k is tight. Check what a larger context costs with `gatavat info <id>`: the KV-cache
 estimate scales linearly with `ctx_size`. Hybrid models (Qwen3-Next, Qwen3.5/3.6) need far less
 KV memory per token than classic transformers, so for them 128k is usually cheap. For example:
 
 ```sh
-llmctl set qwen3-coder ctx_size=131072
-llmctl opencode --write && llmctl restart qwen3-coder
+gatavat set qwen3-coder ctx_size=131072
+gatavat opencode --write && gatavat restart qwen3-coder
 ```
 
 opencode compacts (summarizes) the conversation as it approaches the limit you advertise.
@@ -127,4 +127,4 @@ and lets you add your own, for example Solidity:
 
 The language server programs must be installed (e.g. `rustup component add rust-analyzer`,
 `npm i -g @nomicfoundation/solidity-language-server`). Servers start when the agent first reads
-a matching file. `llmctl opencode --write` keeps the `lsp` block.
+a matching file. `gatavat opencode --write` keeps the `lsp` block.

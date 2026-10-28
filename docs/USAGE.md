@@ -16,34 +16,34 @@
 ## Everyday commands
 
 ```sh
-llmctl                          # status of all models + gateway (same as: llmctl status / ls / ps)
-llmctl ui [--port N] [--no-open]  # web UI, default http://127.0.0.1:8090 (opens it if already running)
-llmctl ui -d                    # run the UI in the background, no terminal needed
-llmctl ui stop | restart | status
-llmctl start                    # start the models marked autostart
-llmctl start a b -w             # start several, wait until loaded
-llmctl start --all
-llmctl stop a | --all
-llmctl restart a                # apply changed settings
-llmctl logs a [-n 200] [-f]     # server log (`llmctl logs gateway` for the gateway)
-llmctl run a                    # foreground, for debugging (Ctrl-C stops it)
-llmctl cmd a                    # print the exact llama-server command
+gatavat                          # status of all models + gateway (same as: gatavat status / ls / ps)
+gatavat ui [--port N] [--no-open]  # web UI, default http://127.0.0.1:8090 (opens it if already running)
+gatavat ui -d                    # run the UI in the background, no terminal needed
+gatavat ui stop | restart | status
+gatavat start                    # start the models marked autostart
+gatavat start a b -w             # start several, wait until loaded
+gatavat start --all
+gatavat stop a | --all
+gatavat restart a                # apply changed settings
+gatavat logs a [-n 200] [-f]     # server log (`gatavat logs gateway` for the gateway)
+gatavat run a                    # foreground, for debugging (Ctrl-C stops it)
+gatavat cmd a                    # print the exact llama-server command
 ```
 
 Models run detached in their own process group. Their pid and command are stored in
-`~/.config/llmctl/run/<id>.json`, which is how the CLI and the UI share state.
+`~/.config/gatavat/run/<id>.json`, which is how the CLI and the UI share state.
 
 ## Model settings
 
 ```sh
-llmctl show a                           # all settings, grouped, plus the command line
-llmctl set a ctx_size=131072 flash_attn=on
-llmctl set a parallel=                  # empty value = unset (use llama-server's default)
-llmctl start a --ctx 65536              # one-off override; --save keeps it
-llmctl start a -s temp=0.2 -s top_k=40  # any setting as a one-off
-llmctl add b --from a model=~/Models/x.gguf
-llmctl rm b
-llmctl reset [a ...]                    # restore built-in defaults
+gatavat show a                           # all settings, grouped, plus the command line
+gatavat set a ctx_size=131072 flash_attn=on
+gatavat set a parallel=                  # empty value = unset (use llama-server's default)
+gatavat start a --ctx 65536              # one-off override; --save keeps it
+gatavat start a -s temp=0.2 -s top_k=40  # any setting as a one-off
+gatavat add b --from a model=~/Models/x.gguf
+gatavat rm b
+gatavat reset [a ...]                    # restore built-in defaults
 ```
 
 | setting | llama-server flag | notes |
@@ -54,7 +54,7 @@ llmctl reset [a ...]                    # restore built-in defaults
 | host | `--host` | `127.0.0.1` = this machine only, `0.0.0.0` = whole network |
 | port | `--port` | |
 | ctx_size | `--ctx-size` | context window in tokens |
-| autostart | | started by `llmctl start` with no ids |
+| autostart | | started by `gatavat start` with no ids |
 | ngl | `-ngl` | layers on the GPU, `999` = all |
 | threads | `--threads` | number or `auto` (all cores) |
 | parallel | `--parallel` | request slots |
@@ -77,7 +77,7 @@ llama-server loads the remaining parts itself.
 
 **Thinking.** For hybrid reasoning models (for example Qwen3.6), `thinking=off` disables
 reasoning on the server. The setting only appears in the UI when the model's chat template has
-an `enable_thinking` switch. llmctl checks your llama-server's `--help` and uses whichever
+an `enable_thinking` switch. gatavat checks your llama-server's `--help` and uses whichever
 mechanism the build supports: `--reasoning-budget`, `--reasoning`, or `--chat-template-kwargs`.
 
 **Strict chat templates.** Some templates (Mistral, Devstral) reject a conversation unless it is
@@ -93,8 +93,8 @@ with, status shows "config changed, restart to apply" and the UI shows a warning
 ## Global settings
 
 ```sh
-llmctl global                       # show all, plus which llama-server binary was found
-llmctl global key=value ...
+gatavat global                       # show all, plus which llama-server binary was found
+gatavat global key=value ...
 ```
 
 | key | default | meaning |
@@ -105,17 +105,17 @@ llmctl global key=value ...
 | gateway_autostart | `true` | start the gateway whenever a model starts |
 | gateway_api_key | (blank) | key other machines must send (`Authorization: Bearer <key>`). Blank = other machines are refused |
 | gateway_allow | (blank) | IPs or networks allowed from other machines, e.g. `192.168.1.0/24, 100.64.0.0/10`. Blank = any address with the key |
-| opencode_path | `~/.config/opencode/opencode.json` | file written by `llmctl opencode --write` |
+| opencode_path | `~/.config/opencode/opencode.json` | file written by `gatavat opencode --write` |
 | opencode_mode | `gateway` | `gateway` = one provider for all models; `per-model` = one provider per model port |
 | opencode_provider_id | `llama-local` | provider id in gateway mode |
-| opencode_bin | `opencode` | opencode binary used by `llmctl oc` |
-| opencode_profiles_dir | `~/.config/opencode/profiles` | where `llmctl oc <name>` looks for `<name>.json` |
-| opencode_default_profile | (blank) | profile used by a bare `llmctl oc`; blank = opencode's normal config |
+| opencode_bin | `opencode` | opencode binary used by `gatavat oc` |
+| opencode_profiles_dir | `~/.config/opencode/profiles` | where `gatavat oc <name>` looks for `<name>.json` |
+| opencode_default_profile | (blank) | profile used by a bare `gatavat oc`; blank = opencode's normal config |
 
 ## Model specs and memory
 
 ```sh
-llmctl info [a ...] [--json]
+gatavat info [a ...] [--json]
 ```
 
 Reads only the GGUF header (milliseconds, the model is not loaded) and shows:
@@ -134,12 +134,12 @@ It warns when `ctx_size` exceeds the trained context, split parts are missing, o
 ## Chat test
 
 ```sh
-llmctl chat a                         # interactive
-llmctl chat a "one-shot prompt" -t 0.2 -m 512
-llmctl chat a --system "Be terse"
-llmctl chat a "hi" --think off        # per-request thinking switch (hybrid models)
-llmctl chat a "hi" --no-think         # only hides the reasoning output
-llmctl chat emb "some text"           # embedding model: dim, norm, cosine vs. previous input
+gatavat chat a                         # interactive
+gatavat chat a "one-shot prompt" -t 0.2 -m 512
+gatavat chat a --system "Be terse"
+gatavat chat a "hi" --think off        # per-request thinking switch (hybrid models)
+gatavat chat a "hi" --no-think         # only hides the reasoning output
+gatavat chat emb "some text"           # embedding model: dim, norm, cosine vs. previous input
 ```
 
 Interactive commands: `/clear`, `/system <text>`, `/think on|off|default`, `/exit`. Ctrl-C
@@ -151,7 +151,7 @@ prompt, temperature, max tokens and a thinking switch where supported.
 ## Gateway
 
 ```sh
-llmctl gateway [status|start|stop|restart]
+gatavat gateway [status|start|stop|restart]
 ```
 
 A single OpenAI-compatible endpoint, `http://127.0.0.1:8100/v1`. Each `POST /v1/...` is
@@ -159,11 +159,11 @@ forwarded to the model named in the request's `model` field: alias or id, with o
 `provider/` prefix. Responses, including streams, are passed through unchanged.
 
 - `GET /v1/models` lists all configured models with their state and port.
-- A request for a stopped model returns HTTP 503 with "start it with `llmctl start <id>`". Models
+- A request for a stopped model returns HTTP 503 with "start it with `gatavat start <id>`". Models
   are not loaded on demand.
 - It starts with the first model (`gateway_autostart`) and keeps running after models stop. It
   uses almost no resources.
-- The log is at `~/.config/llmctl/logs/_gateway.log` (`llmctl logs gateway`), with the client address of each request.
+- The log is at `~/.config/gatavat/logs/_gateway.log` (`gatavat logs gateway`), with the client address of each request.
 
 ## Sharing with other machines
 
@@ -171,15 +171,15 @@ Someone else can use your models through the gateway, for example a friend on th
 Your models keep listening on `127.0.0.1`; only the gateway is reachable from outside.
 
 ```sh
-llmctl share --enable                   # listen on all networks, create an API key
-llmctl share --host 100.101.102.103     # or listen on one address only, e.g. your Tailscale IP
-llmctl share --allow 192.168.1.23       # optional: only these IPs/networks (comma-separated)
-llmctl share                            # print addresses, key, a curl test and an opencode provider
-llmctl share --new-key                  # rotate the key (the old one stops working immediately)
-llmctl share --disable                  # this machine only again (the key is kept)
+gatavat share --enable                   # listen on all networks, create an API key
+gatavat share --host 100.101.102.103     # or listen on one address only, e.g. your Tailscale IP
+gatavat share --allow 192.168.1.23       # optional: only these IPs/networks (comma-separated)
+gatavat share                            # print addresses, key, a curl test and an opencode provider
+gatavat share --new-key                  # rotate the key (the old one stops working immediately)
+gatavat share --disable                  # this machine only again (the key is kept)
 ```
 
-`llmctl share` prints everything the other person needs: the address (`http://<your-mac>.local:8100/v1`,
+`gatavat share` prints everything the other person needs: the address (`http://<your-mac>.local:8100/v1`,
 your IP, and your Tailscale IP if Tailscale is installed), the key, a `curl` test,
 `OPENAI_BASE_URL`/`OPENAI_API_KEY` for OpenAI-compatible tools, and an opencode provider block
 (`llama-shared`) to merge into their `opencode.json`.
@@ -206,14 +206,14 @@ Notes:
 
 ## Web UI
 
-`llmctl ui` serves the UI on `127.0.0.1:8090` and opens the browser. Each model has a card with
+`gatavat ui` serves the UI on `127.0.0.1:8090` and opens the browser. Each model has a card with
 status, endpoint, specs summary, Start / Restart / Stop / Logs / Chat, the context size and port,
 and all other settings under "All settings & command". The header shows the gateway status,
 **Start autostart models**, **Stop all**, the **opencode.json** preview and write, **Add model**,
 and global **Settings**.
 
-Stop the UI with Ctrl-C (foreground) or `llmctl ui stop` (from any terminal, also for `-d`). If it's
-already running, `llmctl ui` opens it in the browser. Stopping the UI does not stop models or the gateway.
+Stop the UI with Ctrl-C (foreground) or `gatavat ui stop` (from any terminal, also for `-d`). If it's
+already running, `gatavat ui` opens it in the browser. Stopping the UI does not stop models or the gateway.
 
 ## Built-in example models
 
@@ -239,31 +239,31 @@ and the UI on 8090.
 cd ~/Projects/gatavat && git pull   # wherever you cloned it
 ```
 
-CLI commands always run the current code. Long-running llmctl processes need a restart to pick
+CLI commands always run the current code. Long-running gatavat processes need a restart to pick
 up new code:
 
-- **web UI:** Ctrl-C, then `llmctl ui`
-- **gateway:** `llmctl gateway restart`
+- **web UI:** Ctrl-C, then `gatavat ui`
+- **gateway:** `gatavat gateway restart`
 
-Running models don't need a restart; they are llama-server processes, not llmctl code. Your
+Running models don't need a restart; they are llama-server processes, not gatavat code. Your
 config is kept. New settings appear with their defaults.
 
 ## Files
 
 | path | contents |
 |---|---|
-| `~/.config/llmctl/config.json` | all settings. Set `LLMCTL_HOME` to use another folder |
-| `~/.config/llmctl/logs/<id>.log` | server logs, rotated at 20 MB; `_gateway.log` for the gateway |
-| `~/.config/llmctl/run/<id>.json` | pid and command of running servers |
-| `~/.config/llmctl/server-flags.json` | cached `llama-server --help` flags |
+| `~/.config/gatavat/config.json` | all settings. Set `GATAVAT_HOME` to use another folder |
+| `~/.config/gatavat/logs/<id>.log` | server logs, rotated at 20 MB; `_gateway.log` for the gateway |
+| `~/.config/gatavat/run/<id>.json` | pid and command of running servers |
+| `~/.config/gatavat/server-flags.json` | cached `llama-server --help` flags |
 
 ## Troubleshooting
 
 | symptom | cause / fix |
 |---|---|
-| "model file not found" | Wrong `model` path. `llmctl show <id>` prints the expanded path |
-| "exited (see logs)" right after start | `llmctl logs <id>`. Common causes: `unknown model architecture` (llama.cpp too old, so update it), not enough memory, port in use |
-| "'llama-server' not found on PATH" | `llmctl global llama_server=/full/path/to/llama-server` |
-| "something is already listening on port N" | Another program uses the port. Change it with `llmctl set <id> port=...` |
-| new UI features missing after an update | Restart the UI (and `llmctl gateway restart`) |
+| "model file not found" | Wrong `model` path. `gatavat show <id>` prints the expanded path |
+| "exited (see logs)" right after start | `gatavat logs <id>`. Common causes: `unknown model architecture` (llama.cpp too old, so update it), not enough memory, port in use |
+| "'llama-server' not found on PATH" | `gatavat global llama_server=/full/path/to/llama-server` |
+| "something is already listening on port N" | Another program uses the port. Change it with `gatavat set <id> port=...` |
+| new UI features missing after an update | Restart the UI (and `gatavat gateway restart`) |
 | CMake build errors after updating llama.cpp | `cmake -B build --fresh` (a stale cache can reference an old macOS SDK) |

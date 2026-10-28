@@ -4,7 +4,7 @@
 
 ### Added
 
-- `llmctl oc [profile]` (alias `llmctl code`) starts opencode with
+- `gatavat oc [profile]` (alias `gatavat code`) starts opencode with
   `OPENCODE_CONFIG=<profiles_dir>/<profile>.json`. Use `-s <id>` to start models first and wait
   until they're ready, `--list` to list profiles, and `--` to pass arguments to opencode. New
   global settings: `opencode_bin`, `opencode_profiles_dir`, `opencode_default_profile`.
@@ -13,30 +13,35 @@
   64k context with q8_0 KV cache). Models you add now start at port 8108.
 - **opencode reminders:** the web UI shows a banner when `opencode.json` no longer matches your
   models (e.g. after changing a context size), with a one-click write, followed by a reminder to
-  restart opencode. `llmctl set/add/reset`, `llmctl status` and `llmctl opencode --write` print
+  restart opencode. `gatavat set/add/reset`, `gatavat status` and `gatavat opencode --write` print
   the same hints.
 - **Context size dropdown** in the web UI with the standard sizes (2k to 256k). Each option shows
   its KV-cache memory and the change from the current setting, and flags sizes above the trained
   context. "Other…" accepts any value.
 
-- `llmctl ui stop | restart | status` and `llmctl ui -d` (background). `llmctl ui` opens the
-  running UI instead of failing with "Address already in use". `llmctl status` shows the UI.
+- `gatavat ui stop | restart | status` and `gatavat ui -d` (background). `gatavat ui` opens the
+  running UI instead of failing with "Address already in use". `gatavat status` shows the UI.
 
 - Gateway fix for strict chat templates (Mistral/Devstral): system messages are merged into one
   and consecutive same-role messages are joined, so opencode's requests no longer fail with
   "conversation roles must alternate". Auto-detected from the GGUF; new setting `fix_roles`.
 
-- **Sharing with other machines:** `llmctl share` (`--enable`, `--host`, `--allow`, `--new-key`,
+- **Sharing with other machines:** `gatavat share` (`--enable`, `--host`, `--allow`, `--new-key`,
   `--disable`) exposes the gateway with an API key and prints addresses, the key, a curl test,
   OpenAI environment variables and an opencode provider for the other machine. New global
   settings `gateway_api_key` and `gateway_allow`, also in the UI's Settings. The gateway log shows
   each request's client address.
 - Guide [docs/TAILSCALE.md](docs/TAILSCALE.md) for sharing models over Tailscale, for host and guest.
-  `llmctl share` lists this machine's Tailscale name and address.
-- `llmctl logs gateway` shows the gateway log.
+  `gatavat share` lists this machine's Tailscale name and address.
+- `gatavat logs gateway` shows the gateway log.
 
 ### Changed
 
+- **Renamed llmctl to gatavat**, the name of the repository. The command is now `gatavat`, the
+  config folder `~/.config/gatavat` and the variable `GATAVAT_HOME`. On first run, an existing
+  `~/.config/llmctl` is moved there and replaced by a symlink, so settings, logs and running models
+  carry over. `LLMCTL_HOME` still works. Replace the `llmctl` symlink on your PATH with one to
+  `gatavat`.
 - The gateway refuses requests from other machines unless `gateway_api_key` is set. Before, setting
   `gateway_host=0.0.0.0` let anyone on the network use it. Requests from this machine are unchanged,
   except ones relayed by a local proxy such as `tailscale serve` (recognized by their proxy headers).

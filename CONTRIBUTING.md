@@ -6,9 +6,9 @@ library only, plus the single `ui.html` file.
 
 ## Before you open a pull request
 
-- Run `./llmctl --version` and `./llmctl` to check that the script still loads.
+- Run `./gatavat --version` and `./gatavat` to check that the script still loads.
 - Test changes against an isolated config so your real setup is untouched:
-  `LLMCTL_HOME=$(mktemp -d) ./llmctl ...`
+  `GATAVAT_HOME=$(mktemp -d) ./gatavat ...`
 - Update `docs/` and `CHANGELOG.md` when behaviour or settings change.
 
 ## Commit messages
@@ -21,7 +21,7 @@ Every commit message starts with a keyword, then a short description of what the
 ```
 
 - Write the description in the imperative, lower case, without a trailing period:
-  `fix: assign a free port in llmctl add`, not `Fixed port bug.`
+  `fix: assign a free port in gatavat add`, not `Fixed port bug.`
 - The scope is optional and names the part that changed, e.g. `gateway`, `ui`, `cli`,
   `opencode`, `specs`, `chat`.
 - Add a body after a blank line when the *why* isn't obvious.
@@ -47,12 +47,12 @@ Examples:
 
 ```
 feat(gateway): list model state on /v1/models
-fix(cli): assign a free port in llmctl add
+fix(cli): assign a free port in gatavat add
 docs: explain split GGUF paths
 chore: release 0.2.0
 ```
 
 ## Releases
 
-Bump `__version__` in `llmctl`, add a section to `CHANGELOG.md`, commit with
+Bump `__version__` in `gatavat`, add a section to `CHANGELOG.md`, commit with
 `chore: release X.Y.Z`, and tag it `vX.Y.Z`.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""llmctl - configure, start and stop local llama.cpp (llama-server) models.
+"""gatavat - configure, start and stop local llama.cpp (llama-server) models.
 
 One CLI and one small web UI sharing the same config file and process state, so a
 model started from the UI can be stopped from the CLI and vice versa. Servers run
@@ -37,7 +37,23 @@ from urllib.parse import parse_qs, urlparse
 __version__ = "0.1.0"
 __author__ = "Dr. Leonhard Horstmeyer <mail@leonhardhorstmeyer.com>"
 
-HOME_DIR = Path(os.environ.get("LLMCTL_HOME", "~/.config/llmctl")).expanduser()
+def _home_dir():
+    env = os.environ.get("GATAVAT_HOME") or os.environ.get("LLMCTL_HOME")  # LLMCTL_HOME: name before 0.2
+    if env:
+        return Path(env).expanduser()
+    new, old = Path("~/.config/gatavat").expanduser(), Path("~/.config/llmctl").expanduser()
+    if not new.exists() and old.is_dir() and not old.is_symlink():
+        # Moved from the old name. The symlink keeps processes started under the old name working.
+        try:
+            old.rename(new)
+            old.symlink_to(new)
+            print(f"gatavat: moved {old} to {new}", file=sys.stderr)
+        except OSError:
+            return old
+    return new
+
+
+HOME_DIR = _home_dir()
 CONFIG_PATH = HOME_DIR / "config.json"
 RUN_DIR = HOME_DIR / "run"
 LOG_DIR = HOME_DIR / "logs"
@@ -59,7 +75,7 @@ FIELDS = [
     F("host", "str", "--host", "General", "127.0.0.1 = this machine only, 0.0.0.0 = whole network"),
     F("port", "int", "--port", "General"),
     F("ctx_size", "int", "--ctx-size", "General", "Context window in tokens"),
-    F("autostart", "bool", None, "General", "Started by `llmctl start` with no arguments"),
+    F("autostart", "bool", None, "General", "Started by `gatavat start` with no arguments"),
     F("ngl", "int", "-ngl", "Performance", "Layers offloaded to the GPU (999 = all)"),
     F("threads", "threads", "--threads", "Performance", "CPU threads: a number, or 'auto' for all cores"),
     F("parallel", "int", "--parallel", "Performance", "Parallel request slots (blank = llama.cpp default)"),
@@ -99,7 +115,7 @@ DEFAULT_GLOBAL = {
     "gateway_host": "127.0.0.1",
     "gateway_port": 8100,
     "gateway_autostart": True,
-    # Sharing (see `llmctl share`): requests from other machines need this key as
+    # Sharing (see `gatavat share`): requests from other machines need this key as
     # "Authorization: Bearer <key>". Requests from this machine never need it.
     "gateway_api_key": "",
     # Comma-separated IPs or networks (e.g. "192.168.1.0/24, 100.64.0.0/10") allowed to use the
@@ -109,7 +125,7 @@ DEFAULT_GLOBAL = {
     # "per-model": one provider per model, each pointing at its own port.
     "opencode_mode": "gateway",
     "opencode_provider_id": "llama-local",
-    # `llmctl oc <profile>` runs opencode with OPENCODE_CONFIG=<profiles_dir>/<profile>.json
+    # `gatavat oc <profile>` runs opencode with OPENCODE_CONFIG=<profiles_dir>/<profile>.json
     "opencode_bin": "opencode",
     "opencode_profiles_dir": "~/.config/opencode/profiles",
     "opencode_default_profile": "",
@@ -409,7 +425,7 @@ def resolve_binary(g):
         if os.path.isfile(p) and os.access(p, os.X_OK):
             return p
     raise UserError(f"'{b}' not found on PATH; set the llama-server path with "
-                    f"`llmctl global llama_server=/path/to/llama-server`")
+                    f"`gatavat global llama_server=/path/to/llama-server`")
 
 
 def build_cmd(m, g, resolve=True):
@@ -600,7 +616,7 @@ def start_model(cfg, mid, m=None):
     lp = log_file(mid)
     _rotate_log(lp)
     logf = open(lp, "ab")
-    logf.write(f"\n===== llmctl start {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n"
+    logf.write(f"\n===== gatavat start {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n"
                f"$ {shlex.join(cmd)}\n".encode())
     logf.flush()
     proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
@@ -959,7 +975,7 @@ def opencode_merged(cfg):
         if g.get("gateway_api_key") and (g.get("gateway_host") or "127.0.0.1") not in LOOPBACK + ("0.0.0.0", "::"):
             opts["apiKey"] = g["gateway_api_key"]
         elif str(opts.get("apiKey", "")).startswith(KEY_PREFIX):
-            del opts["apiKey"]  # a key llmctl wrote earlier and that was since removed
+            del opts["apiKey"]  # a key gatavat wrote earlier and that was since removed
         pmodels = prov.setdefault("models", {})
         for mid, m in exported:
             entry = pmodels.setdefault(m.get("alias") or mid, {"name": m["name"]})
@@ -994,7 +1010,7 @@ def opencode_stale(cfg):
     return path.exists() and out != existing
 
 
-OPENCODE_HINT = "opencode.json is out of date: run `llmctl opencode --write`, then restart opencode"
+OPENCODE_HINT = "opencode.json is out of date: run `gatavat opencode --write`, then restart opencode"
 
 
 def opencode_write(cfg):
@@ -1102,7 +1118,7 @@ def find_model(cfg, name):
 
 
 class GatewayHandler(BaseHTTPRequestHandler):
-    server_version = "llmctl-gateway"
+    server_version = "gatavat-gateway"
 
     def log_message(self, fmt, *args):
         sys.stdout.write(f"{time.strftime('%H:%M:%S')} {self.client_address[0]} {fmt % args}\n")
@@ -1127,7 +1143,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         try:
             nets, ip = parse_allow(g.get("gateway_allow")), _ip(self.client_address[0])
         except (UserError, ValueError):
-            return 403, "gateway_allow is invalid; fix it with `llmctl global gateway_allow=...`"
+            return 403, "gateway_allow is invalid; fix it with `gatavat global gateway_allow=...`"
         if nets and not any(ip in n for n in nets):
             return 403, f"{ip} is not allowed to use this gateway (gateway_allow)"
         if not need_key:
@@ -1142,7 +1158,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         return None
 
     def _error(self, code, msg):
-        data = json.dumps({"error": {"message": msg, "type": "llmctl_gateway", "code": code}}).encode()
+        data = json.dumps({"error": {"message": msg, "type": "gatavat_gateway", "code": code}}).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
@@ -1169,8 +1185,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             data = []
             for mid, m in cfg["models"].items():
                 st = model_status(mid, m, cfg["global"])["state"]
-                data.append({"id": m.get("alias") or mid, "object": "model", "owned_by": "llmctl",
-                             "llmctl_id": mid, "state": st, "port": m["port"]})
+                data.append({"id": m.get("alias") or mid, "object": "model", "owned_by": "gatavat",
+                             "gatavat_id": mid, "state": st, "port": m["port"]})
             return self._json({"object": "list", "data": data})
         self._error(404, f"not found: {path}")
 
@@ -1193,7 +1209,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return self._error(404, f"unknown model {name!r}; available: {known}")
         state = model_status(mid, m, cfg["global"])["state"]
         if state in ("stopped", "exited"):
-            return self._error(503, f"model {mid} is not running. Start it with `llmctl start {mid}` or in the llmctl UI.")
+            return self._error(503, f"model {mid} is not running. Start it with `gatavat start {mid}` or in the gatavat UI.")
         if path == "/v1/chat/completions" and wants_role_fix(m):
             body = json.loads(raw)
             msgs = body.get("messages") or []
@@ -1217,7 +1233,7 @@ def run_gateway(cfg):
         srv = ThreadingHTTPServer((host, g["gateway_port"]), GatewayHandler)
     except OSError as e:
         raise UserError(f"gateway: cannot listen on {host}:{g['gateway_port']}: {e}")
-    print(f"llmctl gateway on {host}:{g['gateway_port']} ({gateway_url(g)})", flush=True)
+    print(f"gatavat gateway on {host}:{g['gateway_port']} ({gateway_url(g)})", flush=True)
     if gateway_exposed(g):
         print("other machines: " + ("API key required" if g.get("gateway_api_key") else "refused (no API key set)")
               + (f", allowed from {g['gateway_allow']}" if g.get("gateway_allow") else ""), flush=True)
@@ -1254,7 +1270,7 @@ def state_payload(cfg):
 
 
 class UIHandler(BaseHTTPRequestHandler):
-    server_version = "llmctl"
+    server_version = "gatavat"
     allow_any_host = False
 
     def log_message(self, *args):
@@ -1276,7 +1292,7 @@ class UIHandler(BaseHTTPRequestHandler):
         if not self.allow_any_host and host not in ("127.0.0.1", "localhost", "::1"):
             self._send(403, {"error": "forbidden host"})
             return False
-        if mutating and self.headers.get("X-Requested-With") != "llmctl":
+        if mutating and self.headers.get("X-Requested-With") != "gatavat":
             self._send(403, {"error": "missing X-Requested-With header"})
             return False
         return True
@@ -1434,8 +1450,8 @@ def run_ui(cfg, host, port, open_browser):
     url = ui_url(host, port)
     st = ui_status()
     if st["state"] == "running":
-        print(f"llmctl UI is already running (pid {st['pid']}) on {st['url']}"
-              + ("; opening it" if open_browser else "") + ". Stop it with `llmctl ui stop`.")
+        print(f"gatavat UI is already running (pid {st['pid']}) on {st['url']}"
+              + ("; opening it" if open_browser else "") + ". Stop it with `gatavat ui stop`.")
         if open_browser:
             webbrowser.open(st["url"] or url)
         return
@@ -1445,13 +1461,13 @@ def run_ui(cfg, host, port, open_browser):
     except OSError as e:
         raise UserError(f"cannot listen on {host}:{port}: {e}\n"
                         f"Find the process with `lsof -nP -iTCP:{port} -sTCP:LISTEN` and stop it with `kill <PID>`, "
-                        f"or use another port: `llmctl ui --port N`.")
+                        f"or use another port: `gatavat ui --port N`.")
     RUN_DIR.mkdir(parents=True, exist_ok=True)
-    run_file(UI_ID).write_text(json.dumps({"pid": os.getpid(), "cmd": sys.argv, "match": "llmctl ui",
+    run_file(UI_ID).write_text(json.dumps({"pid": os.getpid(), "cmd": sys.argv, "match": "gatavat ui",
                                            "started": time.time(), "url": url}))
-    # `llmctl ui stop` sends SIGTERM; exit through `finally` so the run file is cleaned up.
+    # `gatavat ui stop` sends SIGTERM; exit through `finally` so the run file is cleaned up.
     signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
-    print(f"llmctl UI on {url}  (Ctrl-C or `llmctl ui stop` to quit; running models keep running)", flush=True)
+    print(f"gatavat UI on {url}  (Ctrl-C or `gatavat ui stop` to quit; running models keep running)", flush=True)
     if open_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:
@@ -1514,10 +1530,10 @@ def cmd_status(cfg, args):
     print(f"\ngateway {gw['state']}" + (f" (pid {gw['pid']})" if gw.get("pid") else "") +
           f" -> {gw['url']}  (one endpoint for all models, routed by model name)")
     if gateway_exposed(cfg["global"]):
-        print("        shared on the network" + (" with an API key (`llmctl share`)" if cfg["global"].get("gateway_api_key")
-                                                  else ": no API key, so other machines are refused (`llmctl share --enable`)"))
+        print("        shared on the network" + (" with an API key (`gatavat share`)" if cfg["global"].get("gateway_api_key")
+                                                  else ": no API key, so other machines are refused (`gatavat share --enable`)"))
     ui = ui_status()
-    print(f"ui      running (pid {ui['pid']}) -> {ui['url']}" if ui.get("pid") else "ui      not running (`llmctl ui`)")
+    print(f"ui      running (pid {ui['pid']}) -> {ui['url']}" if ui.get("pid") else "ui      not running (`gatavat ui`)")
     if opencode_stale(cfg):
         print(f"\nnote: {OPENCODE_HINT}")
 
@@ -1554,7 +1570,7 @@ def cmd_start(cfg, args):
                     failed = True
                     print(f"\nerror: {e}", file=sys.stderr)
     elif not failed:
-        print("models load in the background; `llmctl status` or `llmctl logs <id> -f` to follow")
+        print("models load in the background; `gatavat status` or `gatavat logs <id> -f` to follow")
     return 1 if failed else 0
 
 
@@ -1628,7 +1644,7 @@ def cmd_chat(cfg, args):
     m = get_model(cfg, mid)
     st = model_status(mid, m, cfg["global"])
     if st["state"] != "ready":
-        raise UserError(f"{mid} is {st['state']}" + ("" if st["state"] == "loading" else f"; start it with `llmctl start {mid}`"))
+        raise UserError(f"{mid} is {st['state']}" + ("" if st["state"] == "loading" else f"; start it with `gatavat start {mid}`"))
     tty = sys.stdout.isatty()
     dim, bold, reset = ("\033[2m", "\033[1m", "\033[0m") if tty else ("", "", "")
 
@@ -1748,7 +1764,7 @@ def cmd_set(cfg, args):
     cfg["models"][args.id] = m
     save_config(cfg)
     st = model_status(args.id, m, cfg["global"])
-    print(f"saved {args.id}" + (" (running: `llmctl restart " + args.id + "` to apply)" if st.get("stale") else ""))
+    print(f"saved {args.id}" + (" (running: `gatavat restart " + args.id + "` to apply)" if st.get("stale") else ""))
     if opencode_stale(cfg):
         print(f"note: {OPENCODE_HINT}")
 
@@ -1926,12 +1942,12 @@ def cmd_share(cfg, args):
     port, key = g["gateway_port"], g.get("gateway_api_key")
     if not gateway_exposed(g):
         print("Sharing is off: the gateway listens on 127.0.0.1 only.\n"
-              "Turn it on with `llmctl share --enable` (all networks) or `llmctl share --host <ip>` "
+              "Turn it on with `gatavat share --enable` (all networks) or `gatavat share --host <ip>` "
               "(one interface, e.g. your Tailscale IP).")
         return
     if not key:
         print("The gateway listens on the network but has no API key, so it refuses other machines.\n"
-              "Create one with `llmctl share --new-key`.")
+              "Create one with `gatavat share --new-key`.")
         return
     gw = gateway_status(cfg)
     models = [(mid, m) for mid, m in cfg["models"].items() if not m.get("embedding")]
@@ -1939,15 +1955,15 @@ def cmd_share(cfg, args):
     addrs = share_addresses(g)
     base = f"http://{addrs[0][1] if addrs else '<this-machine>'}:{port}/v1"
 
-    print(f"Sharing on: gateway {'running' if gw['state'] == 'running' else 'STOPPED (start it with `llmctl gateway start`)'}"
+    print(f"Sharing on: gateway {'running' if gw['state'] == 'running' else 'STOPPED (start it with `gatavat gateway start`)'}"
           f", listening on {g['gateway_host']}:{port}")
     print("Access: API key required" + (f"; only from {g['gateway_allow']}" if g.get("gateway_allow") else
-                                         "; from any address (limit it with `llmctl share --allow <ip or network>`)"))
+                                         "; from any address (limit it with `gatavat share --allow <ip or network>`)"))
     print("\nAddresses for the other machine:")
     for label, h in addrs:
         print(f"  http://{h}:{port}/v1    ({label})")
     print(f"\nAPI key: {key}")
-    print("\nModels" + ("" if running else " (none running; start one with `llmctl start <id>`)") + ":")
+    print("\nModels" + ("" if running else " (none running; start one with `gatavat start <id>`)") + ":")
     for mid, m in models:
         print(f"  {m.get('alias') or mid:<28} {'running' if mid in running else 'stopped'}")
 
@@ -1967,7 +1983,7 @@ def cmd_share(cfg, args):
     print(json.dumps(provider, indent=2))
     print("-" * 76)
     print("Anyone with this key can use your models while sharing is on. Rotate it with "
-          "`llmctl share --new-key`, turn sharing off with `llmctl share --disable`.")
+          "`gatavat share --new-key`, turn sharing off with `gatavat share --disable`.")
 
 
 def opencode_profiles(g):
@@ -2002,7 +2018,7 @@ def cmd_oc(cfg, args):
         print(f"\r  {mid}: ready" + " " * 20)
     binary = shutil.which(expand(g.get("opencode_bin") or "opencode"))
     if not binary:
-        raise UserError("opencode not found on PATH; set it with `llmctl global opencode_bin=/path/to/opencode`")
+        raise UserError("opencode not found on PATH; set it with `gatavat global opencode_bin=/path/to/opencode`")
     extra = args.args
     if "OPENCODE_CONFIG" in env:
         print(f"OPENCODE_CONFIG={env['OPENCODE_CONFIG']}", flush=True)
@@ -2027,8 +2043,8 @@ def cmd_ui(cfg, args):
         if stop_model(UI_ID, timeout=5):
             print("UI stopped")
         elif port_in_use("127.0.0.1" if host in ("0.0.0.0", "::") else host, port):
-            raise UserError(f"no llmctl UI is registered, but something listens on port {port} (perhaps a UI "
-                            f"from an older llmctl version). Find it with `lsof -nP -iTCP:{port} -sTCP:LISTEN` "
+            raise UserError(f"no gatavat UI is registered, but something listens on port {port} (perhaps a UI "
+                            f"from an older gatavat version). Find it with `lsof -nP -iTCP:{port} -sTCP:LISTEN` "
                             f"and stop it with `kill <PID>`.")
         else:
             print("UI was not running")
@@ -2051,7 +2067,7 @@ def cmd_ui(cfg, args):
         st = ui_status()
         if st["state"] != "running":
             raise UserError(f"UI did not start:\n{tail(log_file(UI_ID), 10)}")
-        print(f"UI running in the background (pid {st['pid']}) on {st['url']}. Stop it with `llmctl ui stop`.")
+        print(f"UI running in the background (pid {st['pid']}) on {st['url']}. Stop it with `gatavat ui stop`.")
         if not args.no_open:
             webbrowser.open(st["url"])
         return
@@ -2068,11 +2084,11 @@ def cmd_config(cfg, args):
 def main(argv=None):
     settings_help = "settings: " + ", ".join(FIELD_BY_KEY)
     ap = argparse.ArgumentParser(
-        prog="llmctl",
+        prog="gatavat",
         description="Configure and run local llama-server models (CLI + web UI).",
-        epilog=f"Config: {CONFIG_PATH}. Override location with LLMCTL_HOME.\n{settings_help}",
+        epilog=f"Config: {CONFIG_PATH}. Override location with GATAVAT_HOME.\n{settings_help}",
     )
-    ap.add_argument("--version", action="version", version=f"llmctl {__version__}")
+    ap.add_argument("--version", action="version", version=f"gatavat {__version__}")
     sub = ap.add_subparsers(dest="command", metavar="<command>")
 
     def add(name, fn, help, aliases=()):
@@ -2117,11 +2133,11 @@ def main(argv=None):
     p = add("cmd", cmd_cmd, "print the llama-server command for a model")
     p.add_argument("id")
 
-    p = add("set", cmd_set, "change saved settings, e.g. `llmctl set qwen3-coder ctx_size=131072`")
+    p = add("set", cmd_set, "change saved settings, e.g. `gatavat set qwen3-coder ctx_size=131072`")
     p.add_argument("id")
     p.add_argument("pairs", nargs="+", metavar="KEY=VALUE", help=settings_help + " (empty value = unset)")
 
-    p = add("add", cmd_add, "add a model, e.g. `llmctl add mymodel model=~/m.gguf port=8106`")
+    p = add("add", cmd_add, "add a model, e.g. `gatavat add mymodel model=~/m.gguf port=8106`")
     p.add_argument("id")
     p.add_argument("pairs", nargs="*", metavar="KEY=VALUE")
     p.add_argument("--from", dest="from_", metavar="ID", help="copy settings from an existing model")
@@ -2131,7 +2147,7 @@ def main(argv=None):
     p = add("reset", cmd_reset, "restore built-in defaults (all built-in models if no ids)")
     p.add_argument("ids", nargs="*")
 
-    p = add("logs", cmd_logs, "show a model's server log (`llmctl logs gateway` for the gateway)")
+    p = add("logs", cmd_logs, "show a model's server log (`gatavat logs gateway` for the gateway)")
     p.add_argument("id")
     p.add_argument("-n", type=int, default=50, help="lines to show (default 50)")
     p.add_argument("-f", "--follow", action="store_true")
@@ -2158,7 +2174,7 @@ def main(argv=None):
     p = add("opencode", cmd_opencode, "preview or write opencode.json providers from this config")
     p.add_argument("--write", action="store_true", help="write it (existing file is backed up first)")
 
-    p = add("oc", cmd_oc, "start opencode with a config profile, e.g. `llmctl oc laizinat`", ["code"])
+    p = add("oc", cmd_oc, "start opencode with a config profile, e.g. `gatavat oc laizinat`", ["code"])
     p.add_argument("profile", nargs="?", help="name in the profiles dir, a path to a .json, or 'default' "
                    "for opencode's normal config (default: opencode_default_profile)")
     p.add_argument("-s", "--start", action="append", metavar="ID", help="start this model first and wait "
@@ -2166,7 +2182,7 @@ def main(argv=None):
     p.add_argument("-l", "--list", action="store_true", help="list available profiles")
     p.add_argument("args", nargs="*", help="after --: arguments passed to opencode")
 
-    p = add("ui", cmd_ui, "open the web UI (`llmctl ui stop|restart|status`, `-d` for background)")
+    p = add("ui", cmd_ui, "open the web UI (`gatavat ui stop|restart|status`, `-d` for background)")
     p.add_argument("action", nargs="?", default="start", choices=["start", "stop", "restart", "status"])
     p.add_argument("-d", "--background", action="store_true", help="run detached (no terminal needed)")
     p.add_argument("--host")

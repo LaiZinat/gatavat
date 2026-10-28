@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>llmctl</title>
+<title>gatavat</title>
 <style>
 :root {
   --bg: #f6f7f9; --panel: #ffffff; --border: #dfe3e8; --text: #1c2026; --muted: #69727d;
@@ -106,7 +106,7 @@ dialog::backdrop { background: rgba(0,0,0,.45); }
 </head>
 <body>
 <header>
-  <h1>llmctl</h1>
+  <h1>gatavat</h1>
   <span id="binary" class="binary"></span>
   <span class="pill" id="gateway" title="One endpoint for all models (used by opencode), routed by model name">
     <span class="dot"></span><span id="gateway-label">gateway</span></span>
@@ -153,7 +153,7 @@ dialog::backdrop { background: rgba(0,0,0,.45); }
         <label class="f">UI port (next start)<input type="text" name="ui_port"></label>
         <label class="f">Gateway host<input type="text" name="gateway_host"></label>
         <label class="f">Gateway port<input type="text" name="gateway_port"></label>
-        <label class="f">Gateway API key (needed by other machines; <code>llmctl share</code>)<input type="text" name="gateway_api_key" autocomplete="off" spellcheck="false"></label>
+        <label class="f">Gateway API key (needed by other machines; <code>gatavat share</code>)<input type="text" name="gateway_api_key" autocomplete="off" spellcheck="false"></label>
         <label class="f">Allowed from (IPs/networks, comma-separated; blank = any with the key)<input type="text" name="gateway_allow" placeholder="e.g. 192.168.1.0/24, 100.64.0.0/10"></label>
         <label class="f">Start gateway with first model<select name="gateway_autostart">
           <option value="true">yes</option><option value="false">no</option></select></label>
@@ -210,7 +210,7 @@ const cards = {};          // id -> {el, dirty:Set}
 let logsFor = null, logsTimer = null;
 
 async function api(path, opts = {}) {
-  const r = await fetch(path, { ...opts, headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'llmctl' } });
+  const r = await fetch(path, { ...opts, headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'gatavat' } });
   const j = await r.json().catch(() => ({ error: r.statusText }));
   if (!r.ok) throw new Error(j.error || r.statusText);
   return j;
@@ -550,7 +550,7 @@ async function sendChat() {
   try {
     if (m.config.embedding) {
       const r = await fetch(path + 'embeddings', { method: 'POST', signal: chatAbort.signal,
-        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'llmctl' },
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'gatavat' },
         body: JSON.stringify({ model: m.config.alias || 'local', input: text }) });
       const j = await r.json(); if (!r.ok) throw new Error(j.error || r.statusText);
       const v = j.data[0].embedding, norm = Math.hypot(...v);
@@ -572,7 +572,7 @@ async function sendChat() {
     if (max) body.max_tokens = max;
     if (canThink(m) && $('chat-think').value) body.chat_template_kwargs = { enable_thinking: $('chat-think').value === 'on' };
     const r = await fetch(path + 'chat/completions', { method: 'POST', signal: chatAbort.signal,
-      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'llmctl' }, body: JSON.stringify(body) });
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'gatavat' }, body: JSON.stringify(body) });
     if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.error || r.statusText); }
 
     const bubble = addMsg('assistant', ''), textNode = document.createTextNode('');

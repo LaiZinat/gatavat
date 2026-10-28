@@ -2,7 +2,7 @@
 
 This guide is for two people:
 
-- the **host**, whose computer runs the models with llmctl, and
+- the **host**, whose computer runs the models with gatavat, and
 - the **guest**, for example a family member, who wants to use those models from their own
   computer, at home or anywhere else.
 
@@ -12,11 +12,11 @@ address, as if both were on the same Wi‑Fi. Nothing has to be opened on the ro
 the internet can't see the models.
 
 ```text
-guest's laptop ──(Tailscale, encrypted)──> host's Mac :8100  llmctl gateway ──> llama-server models
+guest's laptop ──(Tailscale, encrypted)──> host's Mac :8100  gatavat gateway ──> llama-server models
    opencode / OpenHands / curl               API key required        (127.0.0.1 only)
 ```
 
-The guest doesn't need llmctl or llama.cpp, only Tailscale and the program they want to use the
+The guest doesn't need gatavat or llama.cpp, only Tailscale and the program they want to use the
 models with.
 
 - [Part 1: Host](#part-1-host)
@@ -43,10 +43,10 @@ has a Tailscale address starting with `100.`, shown in the menu bar app.
 Under Tailscale's **Settings**, turn on **Launch at login** so the address keeps working after a
 restart.
 
-### 2. Turn on sharing in llmctl
+### 2. Turn on sharing in gatavat
 
 ```sh
-llmctl share --enable --allow 100.64.0.0/10
+gatavat share --enable --allow 100.64.0.0/10
 ```
 
 - `--enable` makes the gateway listen on the network and creates an API key.
@@ -58,14 +58,14 @@ llmctl share --enable --allow 100.64.0.0/10
 The first time another computer connects, macOS asks whether Python may accept incoming
 connections. Click **Allow**.
 
-> Alternative: `llmctl share --host <your 100.x address>` listens on the Tailscale address only.
+> Alternative: `gatavat share --host <your 100.x address>` listens on the Tailscale address only.
 > That gateway can't start until Tailscale is connected, though, so after a restart you may have
-> to run `llmctl gateway restart`. `--enable --allow ...` doesn't have that problem.
+> to run `gatavat gateway restart`. `--enable --allow ...` doesn't have that problem.
 
 ### 3. Start the models they should use
 
 ```sh
-llmctl start qwen36-35b -w
+gatavat start qwen36-35b -w
 ```
 
 Only running models answer. The guest gets HTTP 503 "model … is not running" for the others.
@@ -82,7 +82,7 @@ Only running models answer. The guest gets HTTP 503 "model … is not running" f
 Sharing gives the guest your Mac only, not your other devices. Sharing is available on all
 Tailscale plans; check Tailscale's pricing page for whether recipients count towards your plan.
 
-### 5. Limit guests to the llmctl port
+### 5. Limit guests to the gatavat port
 
 A new tailnet's access policy allows everything, so a guest could reach **every** service on your
 Mac that listens on all addresses: AirPlay Receiver, dev servers, file or screen sharing. Check
@@ -110,7 +110,7 @@ times out.
 ### 6. Send the guest their settings
 
 ```sh
-llmctl share
+gatavat share
 ```
 
 This prints the addresses (look for the lines marked **Tailscale**), the API key, a test command,
@@ -124,9 +124,9 @@ and ready-made settings for opencode and other tools. Send the guest:
 
 | task | command |
 |---|---|
-| check what's shared and who could connect | `llmctl share` |
-| see who is using it | `llmctl logs gateway -f` (client address per request) |
-| after a restart of your Mac | `llmctl start <models>`. The gateway starts with the first model |
+| check what's shared and who could connect | `gatavat share` |
+| see who is using it | `gatavat logs gateway -f` (client address per request) |
+| after a restart of your Mac | `gatavat start <models>`. The gateway starts with the first model |
 
 ### Stopping and locking out
 
@@ -134,10 +134,10 @@ From mildest to strongest:
 
 | goal | how | undo |
 |---|---|---|
-| lock everyone out of llmctl at once, e.g. a key leaked | `llmctl share --new-key`. The old key stops working immediately; send the new one (`llmctl share`) only to those who keep access | (keys can't be restored) |
-| remove one person for good | admin console → **Machines** → your Mac → ⋯ → **Share…** → remove them. Also run `llmctl share --new-key` if they had the key | share again |
-| stop sharing the models, keep using them yourself | `llmctl share --disable`. The gateway listens on `127.0.0.1` only again; the key is kept | `llmctl share --enable` |
-| stop the gateway entirely | `llmctl gateway stop`. Your own opencode loses its endpoint too | `llmctl gateway start` |
+| lock everyone out of gatavat at once, e.g. a key leaked | `gatavat share --new-key`. The old key stops working immediately; send the new one (`gatavat share`) only to those who keep access | (keys can't be restored) |
+| remove one person for good | admin console → **Machines** → your Mac → ⋯ → **Share…** → remove them. Also run `gatavat share --new-key` if they had the key | share again |
+| stop sharing the models, keep using them yourself | `gatavat share --disable`. The gateway listens on `127.0.0.1` only again; the key is kept | `gatavat share --enable` |
+| stop the gateway entirely | `gatavat gateway stop`. Your own opencode loses its endpoint too | `gatavat gateway start` |
 | take your Mac off Tailscale for now | menu bar icon → **Disconnect**, or `tailscale down` | **Connect**, or `tailscale up` |
 
 The `tailscale` command is inside the app:
@@ -199,7 +199,7 @@ The host's computer behaves like an OpenAI-compatible API. Every program needs t
 | API key | the `llm-…` key from the host |
 | Model | a model name from `/v1/models`, e.g. `qwen3.6-35b-a3b` |
 
-**opencode.** Add the block that `llmctl share` printed to `~/.config/opencode/opencode.json`
+**opencode.** Add the block that `gatavat share` printed to `~/.config/opencode/opencode.json`
 (merge it into an existing `"provider"` section), restart opencode and choose
 `llama-shared/<model>` with `/models`. It looks like this:
 
@@ -237,22 +237,22 @@ export OPENAI_BASE_URL=http://<host-mac>.<tailnet>.ts.net:8100/v1
 export OPENAI_API_KEY=llm-…
 ```
 
-### If you run llmctl yourself
+### If you run gatavat yourself
 
 You can use your own local models and the host's at the same time: your models through your
 `llama-local` provider, theirs through `llama-shared`. Both providers live side by side in
-`opencode.json`, and `llmctl opencode --write` leaves `llama-shared` untouched.
+`opencode.json`, and `gatavat opencode --write` leaves `llama-shared` untouched.
 
 ## Troubleshooting
 
 | what you see | cause and fix |
 |---|---|
 | `curl` hangs, then times out | The host's Mac is asleep or off, Tailscale is disconnected on either side, or macOS blocked Python's incoming connections (host: System Settings → Network → Firewall → Options, allow Python). Check with `tailscale ping <host-mac>` |
-| `Connection refused` | The gateway isn't running or doesn't listen on the network. Host: `llmctl share` and `llmctl gateway restart` |
+| `Connection refused` | The gateway isn't running or doesn't listen on the network. Host: `gatavat share` and `gatavat gateway restart` |
 | `401 missing or wrong API key` | The key is missing, mistyped or was rotated. Ask the host for the current one |
-| `403 … not allowed to use this gateway` | Your address isn't in the host's `gateway_allow`. Host: check `llmctl share` |
-| `403 this gateway has no API key` | Host: `llmctl share --new-key` |
-| `503 model … is not running` | Host: `llmctl start <id>` |
+| `403 … not allowed to use this gateway` | Your address isn't in the host's `gateway_allow`. Host: check `gatavat share` |
+| `403 this gateway has no API key` | Host: `gatavat share --new-key` |
+| `503 model … is not running` | Host: `gatavat start <id>` |
 | name doesn't resolve | Use the `100.x` address, or turn on MagicDNS in your Tailscale admin console |
 | slow answers | The host's computer is busy (their own use, or someone else's). Smaller models answer faster |
 
@@ -269,6 +269,6 @@ in).
   and only exposes the one machine.
 - **HTTPS isn't needed.** Tailscale already encrypts everything between the two devices, so plain
   `http://` over Tailscale is private. `tailscale serve` can add an HTTPS address, but then requests
-  reach the gateway from the host's own machine. llmctl recognizes such relayed requests by their
+  reach the gateway from the host's own machine. gatavat recognizes such relayed requests by their
   proxy headers and still requires the key, but it can't see the guest's address, so with
   `gateway_allow` set they are refused. Prefer the plain setup above.
