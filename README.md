@@ -17,6 +17,8 @@ test them from the terminal or the browser, several at the same time.
 - **Built-in chat test**, streaming in the CLI and the UI, with reasoning output and tokens/s.
   For embedding models it runs an embedding and similarity test instead.
 - **Gateway:** one OpenAI-compatible endpoint (`:8100/v1`) for all models, routed by model name.
+- **Sharing:** `llmctl share --enable` lets a friend on your network use your models with an API
+  key and an optional IP allow-list, and prints the settings they need.
 - **opencode integration:** writes your models into `opencode.json` as a single provider.
 - **No dependencies:** one Python file plus one HTML file, standard library only.
 
@@ -102,15 +104,18 @@ Remove example models you don't need with `llmctl rm <id>`.
 
 - [Usage and configuration reference](docs/USAGE.md): all commands, settings, gateway, files
 - [Using llmctl with opencode](docs/OPENCODE.md): provider export, an agent setup for local models, LSP
+- [Sharing models over Tailscale](docs/TAILSCALE.md): let family or friends use your models from anywhere, step by step for both sides
 - [Changelog](CHANGELOG.md)
 - [Contributing](CONTRIBUTING.md): commit message conventions
 
 ## Security
 
 - The web UI, the gateway and the built-in models listen on `127.0.0.1` only by default.
-- None of them have authentication. Only set a host to `0.0.0.0` on a network you trust,
-  because anyone who can reach the port can use the model (and, for the UI, start and stop
-  processes).
+- To share models with other machines, use `llmctl share` (see
+  [Sharing](docs/USAGE.md#sharing-with-other-machines)): the gateway then requires an API key from
+  other machines, optionally limited to certain addresses. Without a key it refuses them.
+- The web UI and the model servers themselves have no authentication. Don't set their host to
+  `0.0.0.0`: anyone who can reach the port can use the model, or start and stop processes via the UI.
 - The UI rejects requests from other websites (Host header check plus a required custom
   header), so a web page you visit can't control it.
 - llmctl stores no API keys or credentials.

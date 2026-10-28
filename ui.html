@@ -153,6 +153,8 @@ dialog::backdrop { background: rgba(0,0,0,.45); }
         <label class="f">UI port (next start)<input type="text" name="ui_port"></label>
         <label class="f">Gateway host<input type="text" name="gateway_host"></label>
         <label class="f">Gateway port<input type="text" name="gateway_port"></label>
+        <label class="f">Gateway API key (needed by other machines; <code>llmctl share</code>)<input type="text" name="gateway_api_key" autocomplete="off" spellcheck="false"></label>
+        <label class="f">Allowed from (IPs/networks, comma-separated; blank = any with the key)<input type="text" name="gateway_allow" placeholder="e.g. 192.168.1.0/24, 100.64.0.0/10"></label>
         <label class="f">Start gateway with first model<select name="gateway_autostart">
           <option value="true">yes</option><option value="false">no</option></select></label>
         <label class="f">opencode export<select name="opencode_mode">
@@ -447,6 +449,8 @@ function apply(s) {
   const gw = s.gateway;
   $('gateway').className = `pill st-${gw.state === 'running' ? 'ready' : 'stopped'}`;
   $('gateway-label').textContent = gw.state === 'running' ? `gateway ${gw.url}` : 'gateway stopped';
+  const shared = !['127.0.0.1', 'localhost', '::1', ''].includes(s.global.gateway_host || '');
+  if (shared) $('gateway-label').textContent += s.global.gateway_api_key ? ' · shared (key)' : ' · network, no key: refused';
   $('btn-gateway').textContent = gw.state === 'running' ? 'stop' : 'start';
   const grid = document.getElementById('grid');
   const ids = s.models.map(m => m.id);

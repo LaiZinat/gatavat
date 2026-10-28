@@ -26,6 +26,21 @@
   and consecutive same-role messages are joined, so opencode's requests no longer fail with
   "conversation roles must alternate". Auto-detected from the GGUF; new setting `fix_roles`.
 
+- **Sharing with other machines:** `llmctl share` (`--enable`, `--host`, `--allow`, `--new-key`,
+  `--disable`) exposes the gateway with an API key and prints addresses, the key, a curl test,
+  OpenAI environment variables and an opencode provider for the other machine. New global
+  settings `gateway_api_key` and `gateway_allow`, also in the UI's Settings. The gateway log shows
+  each request's client address.
+- Guide [docs/TAILSCALE.md](docs/TAILSCALE.md) for sharing models over Tailscale, for host and guest.
+  `llmctl share` lists this machine's Tailscale name and address.
+- `llmctl logs gateway` shows the gateway log.
+
+### Changed
+
+- The gateway refuses requests from other machines unless `gateway_api_key` is set. Before, setting
+  `gateway_host=0.0.0.0` let anyone on the network use it. Requests from this machine are unchanged,
+  except ones relayed by a local proxy such as `tailscale serve` (recognized by their proxy headers).
+
 ### Fixed
 
 - KV-cache estimate for Qwen3-Next (`qwen3next`) models was 4× too high: only every 4th layer

@@ -6,6 +6,7 @@
 - [Model specs and memory](#model-specs-and-memory)
 - [Chat test](#chat-test)
 - [Gateway](#gateway)
+- [Sharing with other machines](#sharing-with-other-machines)
 - [Web UI](#web-ui)
 - [Built-in example models](#built-in-example-models)
 - [Updating](#updating)
@@ -24,7 +25,7 @@ llmctl start a b -w             # start several, wait until loaded
 llmctl start --all
 llmctl stop a | --all
 llmctl restart a                # apply changed settings
-llmctl logs a [-n 200] [-f]     # server log
+llmctl logs a [-n 200] [-f]     # server log (`llmctl logs gateway` for the gateway)
 llmctl run a                    # foreground, for debugging (Ctrl-C stops it)
 llmctl cmd a                    # print the exact llama-server command
 ```
@@ -102,6 +103,8 @@ llmctl global key=value ...
 | ui_host / ui_port | `127.0.0.1` / `8090` | web UI address |
 | gateway_host / gateway_port | `127.0.0.1` / `8100` | gateway address |
 | gateway_autostart | `true` | start the gateway whenever a model starts |
+| gateway_api_key | (blank) | key other machines must send (`Authorization: Bearer <key>`). Blank = other machines are refused |
+| gateway_allow | (blank) | IPs or networks allowed from other machines, e.g. `192.168.1.0/24, 100.64.0.0/10`. Blank = any address with the key |
 | opencode_path | `~/.config/opencode/opencode.json` | file written by `llmctl opencode --write` |
 | opencode_mode | `gateway` | `gateway` = one provider for all models; `per-model` = one provider per model port |
 | opencode_provider_id | `llama-local` | provider id in gateway mode |
@@ -160,7 +163,46 @@ forwarded to the model named in the request's `model` field: alias or id, with o
   are not loaded on demand.
 - It starts with the first model (`gateway_autostart`) and keeps running after models stop. It
   uses almost no resources.
-- The log is at `~/.config/llmctl/logs/_gateway.log`.
+- The log is at `~/.config/llmctl/logs/_gateway.log` (`llmctl logs gateway`), with the client address of each request.
+
+## Sharing with other machines
+
+Someone else can use your models through the gateway, for example a friend on the same Wi‑Fi.
+Your models keep listening on `127.0.0.1`; only the gateway is reachable from outside.
+
+```sh
+llmctl share --enable                   # listen on all networks, create an API key
+llmctl share --host 100.101.102.103     # or listen on one address only, e.g. your Tailscale IP
+llmctl share --allow 192.168.1.23       # optional: only these IPs/networks (comma-separated)
+llmctl share                            # print addresses, key, a curl test and an opencode provider
+llmctl share --new-key                  # rotate the key (the old one stops working immediately)
+llmctl share --disable                  # this machine only again (the key is kept)
+```
+
+`llmctl share` prints everything the other person needs: the address (`http://<your-mac>.local:8100/v1`,
+your IP, and your Tailscale IP if Tailscale is installed), the key, a `curl` test,
+`OPENAI_BASE_URL`/`OPENAI_API_KEY` for OpenAI-compatible tools, and an opencode provider block
+(`llama-shared`) to merge into their `opencode.json`.
+
+Rules the gateway applies:
+
+- Requests from this machine never need the key, so your own opencode keeps working unchanged.
+- Requests from other machines need the key and, if `gateway_allow` is set, an allowed address.
+  Without a key, other machines are refused (HTTP 403), even if the gateway listens on the network.
+- `/health` needs no key. Key and allow-list changes apply immediately; host changes restart the
+  gateway.
+
+Notes:
+
+- The first time, macOS asks whether Python may accept incoming connections. Allow it, or the
+  other machine times out.
+- Not on the same network? Use Tailscale: see [Sharing models over Tailscale](TAILSCALE.md), a
+  step-by-step guide for both the host and the guest.
+- Traffic is plain HTTP. On your home network or over Tailscale (which encrypts) that's fine; don't
+  expose the port to the internet.
+- Their requests run on your GPU and memory. With `parallel` at 1, their requests and yours wait
+  for each other; more slots let them run side by side at the cost of KV-cache memory per slot.
+- Keep the web UI on `127.0.0.1`; it can start and stop processes and shows the key.
 
 ## Web UI
 

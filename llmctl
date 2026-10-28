@@ -13,9 +13,12 @@ Copyright (c) 2026 SIA LaiZinat. License: MIT
 import argparse
 import copy
 import glob
+import hmac
+import ipaddress
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -96,6 +99,12 @@ DEFAULT_GLOBAL = {
     "gateway_host": "127.0.0.1",
     "gateway_port": 8100,
     "gateway_autostart": True,
+    # Sharing (see `llmctl share`): requests from other machines need this key as
+    # "Authorization: Bearer <key>". Requests from this machine never need it.
+    "gateway_api_key": "",
+    # Comma-separated IPs or networks (e.g. "192.168.1.0/24, 100.64.0.0/10") allowed to use the
+    # gateway from other machines. Blank = any machine that has the key.
+    "gateway_allow": "",
     # "gateway": one opencode provider (opencode_provider_id) for all models, via the gateway.
     # "per-model": one provider per model, each pointing at its own port.
     "opencode_mode": "gateway",
@@ -119,7 +128,40 @@ def set_global(cfg, key, value):
         value = str(value).strip()
     if key == "opencode_mode" and value not in ("gateway", "per-model"):
         raise UserError("opencode_mode must be 'gateway' or 'per-model'")
+    if key == "gateway_allow":
+        value = ", ".join(str(n) for n in parse_allow(value))
     cfg["global"][key] = value
+
+
+LOOPBACK = ("127.0.0.1", "localhost", "::1", "")
+
+
+def parse_allow(text):
+    nets = []
+    for part in re.split(r"[,\s]+", text or ""):
+        if part:
+            try:
+                nets.append(ipaddress.ip_network(part, strict=False))
+            except ValueError:
+                raise UserError(f"gateway_allow: {part!r} is not an IP address or network (e.g. 192.168.1.0/24)")
+    return nets
+
+
+def _ip(addr):
+    ip = ipaddress.ip_address(addr.split("%")[0])
+    return ip.ipv4_mapped or ip if ip.version == 6 else ip
+
+
+def gateway_exposed(g):
+    return (g.get("gateway_host") or "127.0.0.1") not in LOOPBACK
+
+
+KEY_PREFIX = "llm-"
+PROXY_HEADERS = ("X-Forwarded-For", "Forwarded", "X-Real-IP", "Tailscale-User-Login")
+
+
+def new_api_key():
+    return KEY_PREFIX + secrets.token_urlsafe(24)
 
 
 def _model(**kw):
@@ -913,6 +955,11 @@ def opencode_merged(cfg):
         opts = prov.setdefault("options", {})
         opts["baseURL"] = gateway_url(g)
         opts.setdefault("timeout", 600000)
+        # This machine needs no key, except when the gateway listens on one network address only.
+        if g.get("gateway_api_key") and (g.get("gateway_host") or "127.0.0.1") not in LOOPBACK + ("0.0.0.0", "::"):
+            opts["apiKey"] = g["gateway_api_key"]
+        elif str(opts.get("apiKey", "")).startswith(KEY_PREFIX):
+            del opts["apiKey"]  # a key llmctl wrote earlier and that was since removed
         pmodels = prov.setdefault("models", {})
         for mid, m in exported:
             entry = pmodels.setdefault(m.get("alias") or mid, {"name": m["name"]})
@@ -1058,8 +1105,41 @@ class GatewayHandler(BaseHTTPRequestHandler):
     server_version = "llmctl-gateway"
 
     def log_message(self, fmt, *args):
-        sys.stdout.write(f"{time.strftime('%H:%M:%S')} {fmt % args}\n")
+        sys.stdout.write(f"{time.strftime('%H:%M:%S')} {self.client_address[0]} {fmt % args}\n")
         sys.stdout.flush()
+
+    def _is_local(self):
+        """Loopback, or one of this machine's own addresses (the client and the server socket share it).
+        Requests relayed by a local proxy (e.g. `tailscale serve`) come from loopback too; their
+        proxy headers mark them as remote."""
+        if any(self.headers.get(h) for h in PROXY_HEADERS):
+            return False
+        client = self.client_address[0]
+        try:
+            return _ip(client).is_loopback or client == self.connection.getsockname()[0]
+        except (ValueError, OSError):
+            return False
+
+    def _denied(self, g, need_key=True):
+        """Return an (HTTP code, message) pair if this request isn't allowed, else None."""
+        if self._is_local():
+            return None
+        try:
+            nets, ip = parse_allow(g.get("gateway_allow")), _ip(self.client_address[0])
+        except (UserError, ValueError):
+            return 403, "gateway_allow is invalid; fix it with `llmctl global gateway_allow=...`"
+        if nets and not any(ip in n for n in nets):
+            return 403, f"{ip} is not allowed to use this gateway (gateway_allow)"
+        if not need_key:
+            return None
+        key = g.get("gateway_api_key")
+        if not key:
+            return 403, "this gateway has no API key, so it only accepts requests from its own machine"
+        auth = self.headers.get("Authorization", "")
+        given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
+        if not hmac.compare_digest(given.encode(), key.encode()):
+            return 401, "missing or wrong API key (send it as 'Authorization: Bearer <key>')"
+        return None
 
     def _error(self, code, msg):
         data = json.dumps({"error": {"message": msg, "type": "llmctl_gateway", "code": code}}).encode()
@@ -1080,6 +1160,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path.rstrip("/")
         cfg = load_config()
+        denied = self._denied(cfg["global"], need_key=path not in ("/health", "/v1/health"))
+        if denied:
+            return self._error(*denied)
         if path in ("/health", "/v1/health"):
             return self._json({"status": "ok"})
         if path == "/v1/models":
@@ -1093,14 +1176,17 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        cfg = load_config()
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        denied = self._denied(cfg["global"])
+        if denied:
+            return self._error(*denied)
         if not path.startswith("/v1/"):
             return self._error(404, f"not found: {path}")
-        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
         try:
             name = json.loads(raw or b"{}").get("model")
         except (json.JSONDecodeError, AttributeError):
             return self._error(400, "request body must be JSON")
-        cfg = load_config()
         mid, m = find_model(cfg, name)
         if not m:
             known = ", ".join(x.get("alias") or i for i, x in cfg["models"].items())
@@ -1131,7 +1217,10 @@ def run_gateway(cfg):
         srv = ThreadingHTTPServer((host, g["gateway_port"]), GatewayHandler)
     except OSError as e:
         raise UserError(f"gateway: cannot listen on {host}:{g['gateway_port']}: {e}")
-    print(f"llmctl gateway on {gateway_url(g)}", flush=True)
+    print(f"llmctl gateway on {host}:{g['gateway_port']} ({gateway_url(g)})", flush=True)
+    if gateway_exposed(g):
+        print("other machines: " + ("API key required" if g.get("gateway_api_key") else "refused (no API key set)")
+              + (f", allowed from {g['gateway_allow']}" if g.get("gateway_allow") else ""), flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -1424,6 +1513,9 @@ def cmd_status(cfg, args):
     gw = gateway_status(cfg)
     print(f"\ngateway {gw['state']}" + (f" (pid {gw['pid']})" if gw.get("pid") else "") +
           f" -> {gw['url']}  (one endpoint for all models, routed by model name)")
+    if gateway_exposed(cfg["global"]):
+        print("        shared on the network" + (" with an API key (`llmctl share`)" if cfg["global"].get("gateway_api_key")
+                                                  else ": no API key, so other machines are refused (`llmctl share --enable`)"))
     ui = ui_status()
     print(f"ui      running (pid {ui['pid']}) -> {ui['url']}" if ui.get("pid") else "ui      not running (`llmctl ui`)")
     if opencode_stale(cfg):
@@ -1699,8 +1791,11 @@ def cmd_reset(cfg, args):
 
 
 def cmd_logs(cfg, args):
+    if args.id in ("gateway", GATEWAY_ID):
+        args.id = GATEWAY_ID
+    else:
+        get_model(cfg, args.id)
     path = log_file(args.id)
-    get_model(cfg, args.id)
     if not path.exists():
         print(f"no log yet ({path})")
         return
@@ -1751,6 +1846,128 @@ def cmd_gateway(cfg, args):
         gateway_start(cfg)
     gw = gateway_status(cfg)
     print(f"gateway {gw['state']}" + (f" (pid {gw['pid']})" if gw.get("pid") else "") + f" -> {gw['url']}")
+
+
+def share_addresses(g):
+    """Addresses other machines can use to reach the gateway: (label, host) pairs."""
+    host = g.get("gateway_host") or "127.0.0.1"
+    if host not in ("0.0.0.0", "::"):
+        return [("gateway host", host)]
+    out = []
+    name = socket.gethostname()
+    if sys.platform == "darwin":  # the Bonjour name other Macs and phones resolve as <name>.local
+        try:
+            name = subprocess.run(["scutil", "--get", "LocalHostName"], capture_output=True, text=True,
+                                  timeout=3).stdout.strip() or name
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if name and name not in ("localhost",):
+        out.append(("same network, by name", name if name.endswith(".local") else name.split(".")[0] + ".local"))
+    try:  # the address of the default route; connect() on UDP sends nothing
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("192.0.2.1", 9))
+            out.append(("same network, by IP", sock.getsockname()[0]))
+    except OSError:
+        pass
+    ts = tailscale_self()
+    if ts.get("dns"):
+        out.append(("Tailscale, by name", ts["dns"]))
+    if ts.get("ip"):
+        out.append(("Tailscale, by IP", ts["ip"]))
+    return out
+
+
+def tailscale_self():
+    """This machine's Tailscale IPv4 and MagicDNS name, or {} if Tailscale isn't installed or running."""
+    ts = shutil.which("tailscale") or next((x for x in ("/Applications/Tailscale.app/Contents/MacOS/Tailscale",)
+                                            if os.path.exists(x)), None)
+    if not ts:
+        return {}
+    try:
+        st = json.loads(subprocess.run([ts, "status", "--json"], capture_output=True, text=True, timeout=5).stdout)
+        me = st.get("Self") or {}
+        ip = next((a for a in me.get("TailscaleIPs") or [] if ":" not in a), None)
+        return {"ip": ip, "dns": (me.get("DNSName") or "").rstrip(".") or None} if me.get("Online", True) else {}
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, AttributeError):
+        return {}
+
+
+def cmd_share(cfg, args):
+    g = cfg["global"]
+    changed = restart = False
+    if args.disable:
+        if gateway_exposed(g):
+            set_global(cfg, "gateway_host", "127.0.0.1")
+            changed = restart = True
+        print("sharing off: the gateway listens on this machine only (the API key is kept)")
+    if args.enable or args.host:
+        target = args.host or ("0.0.0.0" if not gateway_exposed(g) else g["gateway_host"])
+        if target in LOOPBACK:
+            raise UserError("--host must be a network address, e.g. 0.0.0.0 (all) or your Tailscale IP")
+        if g.get("gateway_host") != target:
+            set_global(cfg, "gateway_host", target)
+            changed = restart = True
+    if args.new_key or ((args.enable or args.host) and not g.get("gateway_api_key")):
+        set_global(cfg, "gateway_api_key", new_api_key())
+        changed = True
+        print("new API key created" + (" (the old one stops working now)" if args.new_key else ""))
+    if args.allow is not None:
+        set_global(cfg, "gateway_allow", args.allow)
+        changed = True
+    if changed:
+        save_config(cfg)
+    if restart and gateway_status(cfg)["state"] == "running":
+        gateway_stop()
+        gateway_start(cfg)
+        print("gateway restarted")
+    if args.disable:
+        return
+
+    port, key = g["gateway_port"], g.get("gateway_api_key")
+    if not gateway_exposed(g):
+        print("Sharing is off: the gateway listens on 127.0.0.1 only.\n"
+              "Turn it on with `llmctl share --enable` (all networks) or `llmctl share --host <ip>` "
+              "(one interface, e.g. your Tailscale IP).")
+        return
+    if not key:
+        print("The gateway listens on the network but has no API key, so it refuses other machines.\n"
+              "Create one with `llmctl share --new-key`.")
+        return
+    gw = gateway_status(cfg)
+    models = [(mid, m) for mid, m in cfg["models"].items() if not m.get("embedding")]
+    running = {mid for mid, m in models if model_status(mid, m, g)["state"] in ("ready", "loading")}
+    addrs = share_addresses(g)
+    base = f"http://{addrs[0][1] if addrs else '<this-machine>'}:{port}/v1"
+
+    print(f"Sharing on: gateway {'running' if gw['state'] == 'running' else 'STOPPED (start it with `llmctl gateway start`)'}"
+          f", listening on {g['gateway_host']}:{port}")
+    print("Access: API key required" + (f"; only from {g['gateway_allow']}" if g.get("gateway_allow") else
+                                         "; from any address (limit it with `llmctl share --allow <ip or network>`)"))
+    print("\nAddresses for the other machine:")
+    for label, h in addrs:
+        print(f"  http://{h}:{port}/v1    ({label})")
+    print(f"\nAPI key: {key}")
+    print("\nModels" + ("" if running else " (none running; start one with `llmctl start <id>`)") + ":")
+    for mid, m in models:
+        print(f"  {m.get('alias') or mid:<28} {'running' if mid in running else 'stopped'}")
+
+    pmodels = {m.get("alias") or mid: {"name": m["name"],
+                                       "limit": {"context": m["ctx_size"], "output": m.get("opencode_output") or 8192}}
+               for mid, m in models if mid in running or not running}
+    provider = {"provider": {"llama-shared": {
+        "npm": "@ai-sdk/openai-compatible", "name": f"llama.cpp ({socket.gethostname().split('.')[0]})",
+        "options": {"baseURL": base, "apiKey": key, "timeout": 600000}, "models": pmodels}}}
+    example = next(iter(pmodels), "MODEL")
+    print("\n--- for the other machine " + "-" * 50)
+    print(f"Test:\n  curl {base}/chat/completions -H 'Authorization: Bearer {key}' \\\n"
+          f"    -H 'Content-Type: application/json' \\\n"
+          f"    -d '{{\"model\": \"{example}\", \"messages\": [{{\"role\": \"user\", \"content\": \"hi\"}}]}}'")
+    print(f"\nOpenAI-compatible tools (OpenHands, Continue, scripts):\n  OPENAI_BASE_URL={base}\n  OPENAI_API_KEY={key}")
+    print("\nopencode: merge this into ~/.config/opencode/opencode.json, then pick llama-shared/<model>:")
+    print(json.dumps(provider, indent=2))
+    print("-" * 76)
+    print("Anyone with this key can use your models while sharing is on. Rotate it with "
+          "`llmctl share --new-key`, turn sharing off with `llmctl share --disable`.")
 
 
 def opencode_profiles(g):
@@ -1914,7 +2131,7 @@ def main(argv=None):
     p = add("reset", cmd_reset, "restore built-in defaults (all built-in models if no ids)")
     p.add_argument("ids", nargs="*")
 
-    p = add("logs", cmd_logs, "show a model's server log")
+    p = add("logs", cmd_logs, "show a model's server log (`llmctl logs gateway` for the gateway)")
     p.add_argument("id")
     p.add_argument("-n", type=int, default=50, help="lines to show (default 50)")
     p.add_argument("-f", "--follow", action="store_true")
@@ -1928,6 +2145,15 @@ def main(argv=None):
 
     p = add("gateway", cmd_gateway, "one endpoint (port 8100) for all models, routed by model name")
     p.add_argument("action", nargs="?", default="status", choices=["status", "start", "stop", "restart", "run"])
+
+    p = add("share", cmd_share, "let other machines use the gateway (API key, allowed addresses) and "
+            "print what they need")
+    p.add_argument("--enable", action="store_true", help="listen on all networks (0.0.0.0); creates a key if needed")
+    p.add_argument("--host", help="listen on one address only, e.g. your Tailscale IP; creates a key if needed")
+    p.add_argument("--disable", action="store_true", help="listen on this machine only again")
+    p.add_argument("--new-key", action="store_true", help="create a new API key (the old one stops working)")
+    p.add_argument("--allow", metavar="LIST", help="IPs or networks allowed to connect, comma-separated "
+                   "(e.g. 192.168.1.23 or 100.64.0.0/10); empty string = any")
 
     p = add("opencode", cmd_opencode, "preview or write opencode.json providers from this config")
     p.add_argument("--write", action="store_true", help="write it (existing file is backed up first)")
